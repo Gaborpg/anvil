@@ -29,12 +29,14 @@ Inside any repo that uses Anvil:
 ```text
 .anvil/
   config.json
+  hooks.yaml
   metadata.jsonl
   store.git/
 ```
 
 - `store.git` is the hidden shadow Git repository
 - `metadata.jsonl` is the append-only checkpoint log
+- `hooks.yaml` is the optional repo-local hook config
 - checkpoints are branch-aware
 - each Git branch maps to an internal shadow ref like `refs/anvil/main`
 
@@ -113,8 +115,10 @@ anvil review --port 4313
 
 ```bash
 anvil init
+anvil install-copilot-hook
 anvil review [--port 4312]
 anvil checkpoint --summary "Updated parser logic"
+anvil hook copilot-after-edit
 anvil timeline
 anvil diff [checkpoint] [checkpoint]
 anvil restore <checkpoint>
@@ -183,6 +187,68 @@ anvil checkpoint \
 ```
 
 If there are no workspace changes, Anvil will tell you and skip creating an empty checkpoint.
+
+## Copilot Auto-Checkpoint Hook
+
+VS Code Copilot hooks use workspace JSON files under:
+
+```text
+.github/hooks/
+```
+
+Install Anvil's VS Code Copilot hook file into the current repo:
+
+```bash
+anvil install-copilot-hook
+```
+
+That creates:
+
+```text
+.github/hooks/anvil-copilot.json
+```
+
+The installed hook calls:
+
+```bash
+anvil hook copilot-after-edit --vscode-hook
+```
+
+Anvil still keeps the actual auto-checkpoint behavior disabled by default. To opt in, enable the repo-local Anvil hook config:
+
+```yaml
+copilot:
+  autoCheckpoint: true
+  summary: "Copilot file changes"
+  kind: after_edit_batch
+  command: copilot
+  testStatus: unknown
+```
+
+Save that as:
+
+```text
+.anvil/hooks.yaml
+```
+
+Then have your Copilot post-edit hook call:
+
+```bash
+anvil hook copilot-after-edit
+```
+
+You can still override the defaults from the command line:
+
+```bash
+anvil hook copilot-after-edit --summary "Copilot refactor" --command "copilot" --test-status unknown
+```
+
+Important:
+- VS Code discovers the workspace hook from `.github/hooks/anvil-copilot.json`
+- this hook is disabled unless `.anvil/hooks.yaml` explicitly enables it
+- if there are no file changes, Anvil will skip the checkpoint
+- this creates an Anvil checkpoint, not a real Git commit
+- the hook is safe to keep repo-local because it lives under `.anvil/`
 
 ## Timeline
 
