@@ -17,6 +17,16 @@ export async function runGit(args: string[], cwd: string, gitDir?: string): Prom
   return stdout.trim();
 }
 
+export async function runGitRaw(args: string[], cwd: string, gitDir?: string): Promise<string> {
+  const effectiveArgs = gitDir ? [`--git-dir=${gitDir}`, "--work-tree=.", ...args] : args;
+  const { stdout } = await execFileAsync("git", effectiveArgs, {
+    cwd,
+    windowsHide: true
+  });
+
+  return stdout;
+}
+
 export async function getCurrentBranch(cwd: string): Promise<string | null> {
   try {
     const branch = await runGit(["branch", "--show-current"], cwd);
@@ -35,5 +45,14 @@ export async function getHeadReflogMessages(cwd: string, limit = 20): Promise<st
       .filter(Boolean);
   } catch {
     return [];
+  }
+}
+
+export async function getOriginUrl(cwd: string): Promise<string | null> {
+  try {
+    const remote = await runGit(["remote", "get-url", "origin"], cwd);
+    return remote.length > 0 ? remote : null;
+  } catch {
+    return null;
   }
 }

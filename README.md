@@ -5,6 +5,9 @@ Minimal Node/TypeScript CLI for local Anvil checkpointing backed by a hidden sha
 ## Commands
 
 ```bash
+anvil init
+anvil review
+anvil checkpoint --summary "Updated parser logic"
 anvil timeline
 anvil diff [checkpoint] [checkpoint]
 anvil restore <checkpoint>
@@ -12,6 +15,25 @@ anvil explain <checkpoint>
 anvil assign-branch <checkpoint> [branch]
 anvil export [--preview] [--message "message"]
 ```
+
+## Install Globally
+
+From the Anvil project itself:
+
+```bash
+npm install
+npm run build:all
+npm link
+```
+
+Then in any Git repository:
+
+```bash
+anvil init
+anvil review
+```
+
+`anvil init` creates `.anvil/` if the repo has never been Anvil-enabled before. Most Anvil commands also auto-initialize the repo on first use, so you can usually go straight to `anvil review` or `anvil checkpoint`.
 
 ## Branch Ownership
 
@@ -27,12 +49,11 @@ Each Anvil checkpoint belongs to exactly one Git branch.
 anvil assign-branch cp-1 main
 ```
 
-## Internal record command
-
-The current scaffold includes an internal recording command to simulate AI-driven edits:
+## Create a checkpoint
 
 ```bash
-anvil __record --kind after_edit_batch --summary "Updated parser logic" --files src/parser.ts
+anvil checkpoint --summary "Updated parser logic"
+anvil checkpoint --summary "Ran tests after parser update" --kind after_test_run --command "npm test" --test-status passed
 ```
 
 ## Development
@@ -45,7 +66,13 @@ npm start -- timeline
 
 ## Local Review App
 
-Run the backend API:
+Run the review app directly from any Git repo:
+
+```bash
+anvil review
+```
+
+Or manually run the backend API:
 
 ```bash
 npm run build

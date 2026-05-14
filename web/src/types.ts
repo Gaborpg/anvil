@@ -21,8 +21,23 @@ export interface ExplainItem extends TimelineItem {
 }
 
 export interface TimelineResponse {
+  repositoryName: string;
+  repositoryRoot: string;
+  originUrl: string | null;
   currentBranch: string | null;
   checkpoints: TimelineItem[];
+}
+
+export interface RepositoryOption {
+  name: string;
+  root: string;
+}
+
+export interface FileSnapshotResponse {
+  checkpointId: string;
+  filePath: string;
+  beforeContent: string | null;
+  afterContent: string | null;
 }
 
 export interface DiffResponse {
@@ -31,4 +46,28 @@ export interface DiffResponse {
 
 export interface ExportPreviewResponse {
   preview: string;
+}
+
+export interface ParsedDiffFile {
+  filePath: string;
+  header: string;
+  diff: string;
+  additions: number;
+  deletions: number;
+  lines: DiffLine[];
+  sideBySideRows: SideBySideRow[];
+}
+
+export interface DiffLine {
+  kind: "context" | "add" | "remove" | "hunk" | "meta";
+  content: string;
+  leftLineNumber: number | null;
+  rightLineNumber: number | null;
+}
+
+export interface SideBySideRow {
+  kind: "paired" | "meta";
+  left: DiffLine | null;
+  right: DiffLine | null;
+  content?: string;
 }

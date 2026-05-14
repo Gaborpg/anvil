@@ -10,6 +10,7 @@ export interface CheckpointMetadata {
   checkpointId: string;
   timestamp: string;
   kind: CheckpointKind;
+  snapshotMode: "full" | "partial";
   gitBranch: string | null;
   shadowRef: string | null;
   parentCheckpointId: string | null;
@@ -33,8 +34,18 @@ export interface StoreConfig {
 }
 
 export interface TimelineResponse {
+  repositoryName: string;
+  repositoryRoot: string;
+  originUrl: string | null;
   currentBranch: string | null;
   checkpoints: CheckpointMetadata[];
+}
+
+export interface FileSnapshotResponse {
+  checkpointId: string;
+  filePath: string;
+  beforeContent: string | null;
+  afterContent: string | null;
 }
 
 export interface RecordCheckpointOptions {

@@ -1,14 +1,24 @@
 #!/usr/bin/env node
-import path from "node:path";
 import process from "node:process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { CheckpointStore } from "./store.js";
 import { formatTimestamp } from "./utils.js";
+
+const execFileAsync = promisify(execFile);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 function printHelp(): void {
   console.log(`anvil
 
 Usage:
+  anvil init
+  anvil review [--port 4312]
   anvil timeline
+  anvil checkpoint --summary "summary" [--kind after_edit_batch] [--command "npm test"] [--test-status passed|failed|unknown]
   anvil diff [checkpoint] [checkpoint]
   anvil restore <checkpoint>
   anvil explain <checkpoint>
@@ -29,6 +39,25 @@ function optionValue(args: string[], flag: string): string | null {
   return args[index + 1];
 }
 
+async function gitStatusFiles(cwd: string): Promise<string[]> {
+  const { stdout } = await execFileAsync("git", ["status", "--short", "--untracked-files=all"], {
+    cwd,
+    windowsHide: true
+  });
+
+  return stdout
+    .replace(/\r?\n$/, "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .map((line) => {
+      const filePart = line.length >= 4 ? line.slice(3).trim() : line.trim();
+      const renameParts = filePart.split(" -> ");
+      return renameParts.at(-1)?.trim() ?? filePart.trim();
+    })
+    .filter((file) => file.length > 0 && !file.startsWith(".anvil"));
+}
+
 async function main(): Promise<void> {
   const [, , command, ...args] = process.argv;
   const repositoryRoot = process.cwd();
@@ -42,6 +71,38 @@ async function main(): Promise<void> {
   await store.init();
 
   switch (command) {
+    case "init": {
+      const config = await store.loadConfig();
+      console.log(`Anvil initialized for ${repositoryRoot}`);
+      console.log(`State directory: ${path.dirname(config.shadowGitDir)}`);
+      console.log(`Shadow store: ${config.shadowGitDir}`);
+      console.log(`Metadata: ${config.metadataFile}`);
+      return;
+    }
+
+    case "review": {
+      const port = optionValue(args, "--port") ?? process.env.ANVIL_PORT ?? "4312";
+      const serverScript = path.join(__dirname, "server.js");
+      console.log(`Starting Anvil review app for ${repositoryRoot}`);
+      console.log(`Anvil will auto-initialize this repo if needed.`);
+      console.log(`Open http://localhost:${port}/`);
+
+      const child = spawn(process.execPath, [serverScript], {
+        cwd: repositoryRoot,
+        stdio: "inherit",
+        env: {
+          ...process.env,
+          ANVIL_PORT: port
+        },
+        windowsHide: false
+      });
+
+      child.on("exit", (code) => {
+        process.exitCode = code ?? 0;
+      });
+      return;
+    }
+
     case "timeline": {
       const timeline = await store.timeline();
       const checkpoints = timeline.checkpoints;
@@ -57,6 +118,45 @@ async function main(): Promise<void> {
         console.log(
           `${checkpoint.checkpointId}  ${formatTimestamp(checkpoint.timestamp)}  ${checkpoint.kind}\n  branch: ${checkpoint.gitBranch ?? "unknown"}\n  ${checkpoint.summary}\n  files: ${files}\n`
         );
+      }
+      return;
+    }
+
+    case "checkpoint": {
+      const summary = optionValue(args, "--summary");
+      if (!summary) {
+        throw new Error('checkpoint requires --summary "summary"');
+      }
+
+      const kind = optionValue(args, "--kind") ?? "after_edit_batch";
+      const commandValue = optionValue(args, "--command");
+      const prompt = optionValue(args, "--prompt");
+      const testStatus = optionValue(args, "--test-status") as "unknown" | "passed" | "failed" | null;
+      const files = await gitStatusFiles(repositoryRoot);
+
+      if (files.length === 0) {
+        console.log("No workspace changes to checkpoint.");
+        return;
+      }
+
+      const checkpoint = await store.recordCheckpoint({
+        kind: kind as "after_edit_batch",
+        summary,
+        filesChanged: files,
+        commandsRun: commandValue ? [commandValue] : [],
+        prompt: prompt ?? undefined,
+        testStatus: testStatus ?? "unknown"
+      });
+
+      console.log(`Recorded ${checkpoint.checkpointId}`);
+      console.log(`Branch: ${checkpoint.gitBranch ?? "unknown"}`);
+      console.log(`Shadow ref: ${checkpoint.shadowRef ?? "unknown"}`);
+      console.log(`Files: ${checkpoint.filesChanged.join(", ")}`);
+      if (checkpoint.bootstrappedFromBranch) {
+        console.log(`Bootstrapped from branch: ${checkpoint.bootstrappedFromBranch}`);
+      }
+      if (checkpoint.bootstrappedFromCheckpointId) {
+        console.log(`Bootstrapped from checkpoint: ${checkpoint.bootstrappedFromCheckpointId}`);
       }
       return;
     }
