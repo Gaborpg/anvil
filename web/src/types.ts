@@ -3,10 +3,14 @@ export interface TimelineItem {
   timestamp: string;
   kind: string;
   gitBranch: string | null;
+  shadowRef: string | null;
   summary: string;
   filesChanged: string[];
   commandsRun: string[];
   testStatus: string;
+  bootstrappedFromBranch?: string | null;
+  bootstrappedFromCheckpointId?: string | null;
+  bootstrappedAt?: string | null;
 }
 
 export interface ExplainItem extends TimelineItem {

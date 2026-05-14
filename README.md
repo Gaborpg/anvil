@@ -9,7 +9,22 @@ anvil timeline
 anvil diff [checkpoint] [checkpoint]
 anvil restore <checkpoint>
 anvil explain <checkpoint>
+anvil assign-branch <checkpoint> [branch]
 anvil export [--preview] [--message "message"]
+```
+
+## Branch Ownership
+
+Each Anvil checkpoint belongs to exactly one Git branch.
+
+- New checkpoints automatically record the current Git branch.
+- Branch-scoped timeline views only show checkpoints assigned to that branch.
+- Anvil keeps one shared shadow repo in `.anvil/store.git`, with a separate internal shadow ref per Git branch.
+- If Anvil runs on a branch that has no shadow ref yet, it lazily creates one and bootstraps it from the inferred parent branch shadow tip when possible.
+- Older legacy checkpoints with no branch must be assigned explicitly:
+
+```bash
+anvil assign-branch cp-1 main
 ```
 
 ## Internal record command

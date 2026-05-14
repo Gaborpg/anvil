@@ -25,3 +25,15 @@ export async function getCurrentBranch(cwd: string): Promise<string | null> {
     return null;
   }
 }
+
+export async function getHeadReflogMessages(cwd: string, limit = 20): Promise<string[]> {
+  try {
+    const output = await runGit(["reflog", "--format=%gs", `-n`, String(limit)], cwd);
+    return output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}

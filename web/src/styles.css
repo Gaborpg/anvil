@@ -75,7 +75,8 @@ input {
 }
 
 .branch-chip,
-.hero-branch {
+.hero-branch,
+.hero-shadow {
   display: inline-flex;
   align-items: center;
   gap: 0.45rem;
@@ -91,10 +92,28 @@ input {
   margin-bottom: 1rem;
 }
 
+.timeline-count {
+  margin-bottom: 1rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
 .timeline-list {
   display: flex;
   flex-direction: column;
   gap: 0.85rem;
+}
+
+.empty-state {
+  padding: 1rem;
+  border: 1px dashed var(--line);
+  border-radius: 18px;
+  background: rgba(255, 251, 246, 0.56);
+}
+
+.empty-state p {
+  margin-bottom: 0;
+  color: var(--muted);
 }
 
 .timeline-item {
@@ -171,7 +190,8 @@ input {
   color: var(--muted);
 }
 
-.hero-branch {
+.hero-branch,
+.hero-shadow {
   margin-top: 0.9rem;
 }
 

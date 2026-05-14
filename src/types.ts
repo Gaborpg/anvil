@@ -11,6 +11,7 @@ export interface CheckpointMetadata {
   timestamp: string;
   kind: CheckpointKind;
   gitBranch: string | null;
+  shadowRef: string | null;
   parentCheckpointId: string | null;
   shadowCommitSha: string;
   filesChanged: string[];
@@ -19,6 +20,9 @@ export interface CheckpointMetadata {
   commandsRun: string[];
   testStatus: "unknown" | "passed" | "failed";
   restoreSourceCheckpointId: string | null;
+  bootstrappedFromBranch: string | null;
+  bootstrappedFromCheckpointId: string | null;
+  bootstrappedAt: string | null;
 }
 
 export interface StoreConfig {

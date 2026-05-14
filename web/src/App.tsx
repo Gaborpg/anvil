@@ -22,6 +22,14 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const timer = window.setInterval(() => {
+      void loadTimeline(true);
+    }, 4000);
+
+    return () => window.clearInterval(timer);
+  }, [selectedCheckpointId]);
+
+  useEffect(() => {
     if (!selectedCheckpointId) {
       return;
     }
@@ -30,7 +38,7 @@ export function App() {
     void loadDiff(selectedCheckpointId);
   }, [selectedCheckpointId]);
 
-  async function loadTimeline() {
+  async function loadTimeline(fromPolling = false) {
     setError(null);
     const response = await fetchTimeline();
     const items = response.checkpoints;
@@ -38,7 +46,22 @@ export function App() {
     setCurrentBranch(response.currentBranch);
 
     const latest = items.at(-1)?.checkpointId ?? null;
-    setSelectedCheckpointId((current) => current ?? latest);
+    setSelectedCheckpointId((current) => {
+      if (!current) {
+        return latest;
+      }
+
+      const stillExists = items.some((item) => item.checkpointId === current);
+      if (stillExists) {
+        return current;
+      }
+
+      if (fromPolling && latest && current !== latest) {
+        setPreviewText("Export preview will appear here.");
+      }
+
+      return latest;
+    });
   }
 
   async function loadCheckpoint(checkpointId: string) {
@@ -98,24 +121,32 @@ export function App() {
         <div className="panel-title">Anvil Timeline</div>
         <div className="panel-subtitle">Private checkpoints for AI-driven changes</div>
         <div className="branch-chip">Branch: {currentBranch ?? "unknown"}</div>
-        <div className="timeline-list">
-          {timeline.map((item) => (
-            <button
-              key={item.checkpointId}
-              className={`timeline-item${item.checkpointId === selectedCheckpointId ? " active" : ""}`}
-              onClick={() => setSelectedCheckpointId(item.checkpointId)}
-              type="button"
-            >
-              <div className="timeline-item-top">
-                <strong>{item.checkpointId}</strong>
-                <span>{item.kind}</span>
-              </div>
-              <div className="timeline-branch">{item.gitBranch ?? "unknown"}</div>
-              <div className="timeline-summary">{item.summary}</div>
-              <div className="timeline-meta">{formatTime(item.timestamp)}</div>
-            </button>
-          ))}
-        </div>
+        <div className="timeline-count">{timeline.length} checkpoint{timeline.length === 1 ? "" : "s"} on this branch</div>
+        {timeline.length > 0 ? (
+          <div className="timeline-list">
+            {timeline.map((item) => (
+              <button
+                key={item.checkpointId}
+                className={`timeline-item${item.checkpointId === selectedCheckpointId ? " active" : ""}`}
+                onClick={() => setSelectedCheckpointId(item.checkpointId)}
+                type="button"
+              >
+                <div className="timeline-item-top">
+                  <strong>{item.checkpointId}</strong>
+                  <span>{item.kind}</span>
+                </div>
+                <div className="timeline-branch">{item.gitBranch ?? "unknown"}</div>
+                <div className="timeline-summary">{item.summary}</div>
+                <div className="timeline-meta">{formatTime(item.timestamp)}</div>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-state">
+            <strong>No checkpoints on this branch yet.</strong>
+            <p>Switch branches or create an Anvil checkpoint to start a branch-local timeline.</p>
+          </div>
+        )}
       </aside>
 
       <main className="review">
@@ -125,6 +156,11 @@ export function App() {
             <h1>Anvil Review Surface</h1>
             <p>Review checkpoint diffs locally, restore safely, and preview the final Git export.</p>
             <div className="hero-branch">Current Git branch: {currentBranch ?? "unknown"}</div>
+            {selectedCheckpoint ? (
+              <div className="hero-shadow">
+                Shadow ref: <span className="mono">{selectedCheckpoint.shadowRef ?? "unknown"}</span>
+              </div>
+            ) : null}
           </div>
           <div className="hero-actions">
             <input
@@ -132,6 +168,9 @@ export function App() {
               onChange={(event) => setExportMessage(event.target.value)}
               placeholder="Export commit message"
             />
+            <button onClick={() => void loadTimeline()} type="button">
+              Refresh Timeline
+            </button>
             <button onClick={() => void handlePreview()} type="button" disabled={busy}>
               {busy ? "Working..." : "Refresh Export Preview"}
             </button>
@@ -156,6 +195,10 @@ export function App() {
                   <p>{selectedCheckpoint.gitBranch ?? "unknown"}</p>
                 </div>
                 <div>
+                  <span className="label">Shadow Ref</span>
+                  <p className="mono">{selectedCheckpoint.shadowRef ?? "unknown"}</p>
+                </div>
+                <div>
                   <span className="label">Summary</span>
                   <p>{selectedCheckpoint.summary}</p>
                 </div>
@@ -174,6 +217,14 @@ export function App() {
                 <div>
                   <span className="label">Commands</span>
                   <p>{selectedCheckpoint.commandsRun.join(" | ") || "None recorded"}</p>
+                </div>
+                <div>
+                  <span className="label">Bootstrap</span>
+                  <p>
+                    {selectedCheckpoint.bootstrappedFromBranch
+                      ? `${selectedCheckpoint.bootstrappedFromBranch} via ${selectedCheckpoint.bootstrappedFromCheckpointId ?? "unknown checkpoint"}`
+                      : "Native branch checkpoint"}
+                  </p>
                 </div>
                 <div>
                   <span className="label">Files</span>

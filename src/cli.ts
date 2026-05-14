@@ -12,6 +12,7 @@ Usage:
   anvil diff [checkpoint] [checkpoint]
   anvil restore <checkpoint>
   anvil explain <checkpoint>
+  anvil assign-branch <checkpoint> [branch]
   anvil export [--preview] [--message "message"]
 
 Internal:
@@ -88,15 +89,37 @@ async function main(): Promise<void> {
       console.log(`${checkpoint.checkpointId} (${checkpoint.kind})`);
       console.log(`Time: ${formatTimestamp(checkpoint.timestamp)}`);
       console.log(`Branch: ${checkpoint.gitBranch ?? "unknown"}`);
+      console.log(`Shadow ref: ${checkpoint.shadowRef ?? "unknown"}`);
       console.log(`Summary: ${checkpoint.summary}`);
       console.log(`Files: ${checkpoint.filesChanged.join(", ") || "none"}`);
       console.log(`Prompt hash: ${checkpoint.promptHash ?? "none"}`);
       console.log(`Commands: ${checkpoint.commandsRun.join(" | ") || "none"}`);
       console.log(`Test status: ${checkpoint.testStatus}`);
       console.log(`Shadow commit: ${checkpoint.shadowCommitSha}`);
+      if (checkpoint.bootstrappedFromBranch) {
+        console.log(`Bootstrapped from branch: ${checkpoint.bootstrappedFromBranch}`);
+      }
+      if (checkpoint.bootstrappedFromCheckpointId) {
+        console.log(`Bootstrapped from checkpoint: ${checkpoint.bootstrappedFromCheckpointId}`);
+      }
       if (checkpoint.restoreSourceCheckpointId) {
         console.log(`Restore source: ${checkpoint.restoreSourceCheckpointId}`);
       }
+      return;
+    }
+
+    case "assign-branch": {
+      const checkpointId = args[0];
+      const branch = args[1] ?? (await store.currentBranch());
+      if (!checkpointId) {
+        throw new Error("assign-branch requires a checkpoint id");
+      }
+      if (!branch) {
+        throw new Error("Could not determine a branch. Pass one explicitly.");
+      }
+
+      const checkpoint = await store.assignCheckpointBranch(checkpointId, branch);
+      console.log(`Assigned ${checkpoint.checkpointId} to branch ${checkpoint.gitBranch}.`);
       return;
     }
 
