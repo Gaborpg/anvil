@@ -81,6 +81,10 @@ export class CheckpointStore {
     return config;
   }
 
+  async uninstall(): Promise<void> {
+    await rm(this.baseDir, { force: true, recursive: true });
+  }
+
   private async ensureShadowExcludes(): Promise<void> {
     const excludePath = path.join(this.shadowGitDir, "info", "exclude");
     const existing = existsSync(excludePath) ? await readFile(excludePath, "utf8") : "";
@@ -357,6 +361,18 @@ export class CheckpointStore {
 
   private async pointShadowHeadAt(shadowRef: string): Promise<void> {
     await runGit(["symbolic-ref", "HEAD", shadowRef], this.repositoryRoot, this.shadowGitDir);
+  }
+
+  private async updateShadowRef(shadowRef: string, commitSha: string): Promise<void> {
+    await runGit(["update-ref", shadowRef, commitSha], this.repositoryRoot, this.shadowGitDir);
+  }
+
+  private async commitTree(treeSha: string, message: string): Promise<string> {
+    return runGit(
+      ["-c", "user.name=anvil", "-c", "user.email=anvil@local", "commit-tree", treeSha, "-m", message],
+      this.repositoryRoot,
+      this.shadowGitDir
+    );
   }
 
   private async latestCheckpointForBranch(branch: string): Promise<CheckpointMetadata | null> {
@@ -713,5 +729,62 @@ export class CheckpointStore {
     );
 
     return `Exported ${latest.checkpointId} to real Git with message: ${message}`;
+  }
+
+  async compactBranchHistory(mode: "keep-last" | "squash"): Promise<CheckpointMetadata | null> {
+    await this.loadConfig();
+    const branch = await this.currentBranch();
+    if (!branch) {
+      throw new Error("Cannot compact Anvil history without an active Git branch.");
+    }
+
+    const checkpoints = await this.readMetadata();
+    const branchCheckpoints = checkpoints.filter((entry) => entry.gitBranch === branch);
+    if (branchCheckpoints.length === 0) {
+      return null;
+    }
+
+    const latest = branchCheckpoints.at(-1)!;
+    let targetSha = latest.shadowCommitSha;
+    let summary = latest.summary;
+
+    if (mode === "squash") {
+      const treeSha = await runGit(["rev-parse", `${latest.shadowCommitSha}^{tree}`], this.repositoryRoot, this.shadowGitDir);
+      targetSha = await this.commitTree(treeSha, `anvil squash ${branch} -> ${latest.checkpointId}`);
+      summary = `Squashed Anvil history for ${branch} into ${latest.checkpointId}`;
+    }
+
+    const retainedEntry: CheckpointMetadata = {
+      ...latest,
+      parentCheckpointId: null,
+      shadowCommitSha: targetSha,
+      summary,
+      bootstrappedFromBranch: null,
+      bootstrappedFromCheckpointId: null,
+      bootstrappedAt: null
+    };
+
+    const nextMetadata = checkpoints.map((entry) => {
+      if (entry.gitBranch !== branch) {
+        return entry;
+      }
+
+      return entry.checkpointId === latest.checkpointId ? retainedEntry : null;
+    }).filter((entry): entry is CheckpointMetadata => entry !== null);
+
+    await this.updateShadowRef(latest.shadowRef ?? this.shadowRefForBranch(branch), targetSha);
+    await this.pointShadowHeadAt(latest.shadowRef ?? this.shadowRefForBranch(branch));
+
+    const serialized = nextMetadata.map((entry) => JSON.stringify(entry)).join("\n");
+    await writeFile(this.metadataFile, serialized.length > 0 ? `${serialized}\n` : "", "utf8");
+
+    try {
+      await runGit(["reflog", "expire", "--expire=now", "--all"], this.repositoryRoot, this.shadowGitDir);
+      await runGit(["gc", "--prune=now"], this.repositoryRoot, this.shadowGitDir);
+    } catch {
+      // Best-effort cleanup only.
+    }
+
+    return retainedEntry;
   }
 }

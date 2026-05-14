@@ -36,6 +36,8 @@ function saveRecentRepositories(items: RepositoryOption[]): void {
 
 export function App() {
   const diffCardRef = useRef<HTMLElement | null>(null);
+  const summaryListRef = useRef<HTMLDivElement | null>(null);
+  const summaryCardRefs = useRef<Record<string, HTMLElement | null>>({});
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [repositoryName, setRepositoryName] = useState<string>("Repository");
@@ -58,6 +60,7 @@ export function App() {
   const [timelineCollapsed, setTimelineCollapsed] = useState<boolean>(false);
   const [heroCollapsed, setHeroCollapsed] = useState<boolean>(false);
   const [detailsCollapsed, setDetailsCollapsed] = useState<boolean>(false);
+  const [expandedSummaryFiles, setExpandedSummaryFiles] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     setRepositoryOptions(loadRecentRepositories());
@@ -216,6 +219,7 @@ export function App() {
     setParsedFiles([]);
     setSelectedFilePath(null);
     setFileSnapshot(null);
+    setExpandedSummaryFiles({});
     setPreviewText("Export preview will appear here.");
     setDiffText("Loading diff...");
 
@@ -233,6 +237,41 @@ export function App() {
     parsedFiles.length > 0
       ? parsedFiles.map((file) => file.filePath)
       : (selectedCheckpoint?.filesChanged ?? []).filter((file) => !file.startsWith(".anvil"));
+  const reviewFiles = visibleFilePaths.map((filePath) => {
+    const parsed = parsedFiles.find((file) => file.filePath === filePath);
+    return (
+      parsed ?? {
+        filePath,
+        header: "",
+        diff: "",
+        additions: 0,
+        deletions: 0,
+        lines: [],
+        sideBySideRows: []
+      }
+    );
+  });
+
+  function jumpToReviewedFile(filePath: string) {
+    setSelectedFilePath(filePath);
+
+    window.requestAnimationFrame(() => {
+      if (diffViewMode === "summary") {
+        const container = summaryListRef.current;
+        const target = summaryCardRefs.current[filePath];
+        if (container && target) {
+          const top = target.offsetTop - container.offsetTop;
+          container.scrollTo({ top, behavior: "smooth" });
+        }
+        return;
+      }
+
+      const container = diffCardRef.current?.querySelector<HTMLElement>(".card-scroll");
+      if (container) {
+        container.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    });
+  }
 
   function renderUnifiedLine(line: DiffLine, key: string) {
     return (
@@ -271,8 +310,21 @@ export function App() {
   }
 
   function renderSummaryCard(file: ParsedDiffFile) {
+    const previewLines = file.lines.filter((line) => line.kind !== "meta");
+    const previewRows = file.sideBySideRows.filter((row) => row.kind !== "meta");
+    const isExpanded = expandedSummaryFiles[file.filePath] ?? false;
+    const visibleLines = isExpanded ? previewLines : previewLines.slice(0, 5);
+    const visibleRows = isExpanded ? previewRows : previewRows.slice(0, 5);
+    const hasMore = previewLines.length > 5;
+
     return (
-      <article key={file.filePath} className="summary-file-card">
+      <article
+        key={file.filePath}
+        ref={(element) => {
+          summaryCardRefs.current[file.filePath] = element;
+        }}
+        className={`summary-file-card${selectedFilePath === file.filePath ? " active" : ""}`}
+      >
         <div className="summary-file-top">
           <div>
             <strong>{file.filePath}</strong>
@@ -283,7 +335,7 @@ export function App() {
           </div>
           <button
             onClick={() => {
-              setSelectedFilePath(file.filePath);
+              jumpToReviewedFile(file.filePath);
               setDiffViewMode("snapshot");
               window.requestAnimationFrame(() => {
                 diffCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -295,16 +347,33 @@ export function App() {
           </button>
         </div>
         <div className="summary-file-preview">
-          {diffViewMode === "side-by-side" ? (
+          {previewLines.length === 0 ? (
+            <div className="summary-empty">No inline patch preview for this file. Use View for the full file snapshot.</div>
+          ) : diffViewMode === "side-by-side" ? (
             <div className="side-by-side-preview">
-              {file.sideBySideRows.slice(0, 8).map((row, index) => renderSideBySideRow(row, `${file.filePath}-${index}`))}
+              {visibleRows.map((row, index) => renderSideBySideRow(row, `${file.filePath}-${index}`))}
             </div>
           ) : (
             <div className="unified-preview">
-              {file.lines.slice(0, 10).map((line, index) => renderUnifiedLine(line, `${file.filePath}-${index}`))}
+              {visibleLines.map((line, index) => renderUnifiedLine(line, `${file.filePath}-${index}`))}
             </div>
           )}
         </div>
+        {hasMore ? (
+          <div className="summary-file-footer">
+            <button
+              onClick={() =>
+                setExpandedSummaryFiles((current) => ({
+                  ...current,
+                  [file.filePath]: !isExpanded
+                }))
+              }
+              type="button"
+            >
+              {isExpanded ? "Collapse" : `Expand all ${previewLines.length} changes`}
+            </button>
+          </div>
+        ) : null}
       </article>
     );
   }
@@ -463,48 +532,19 @@ export function App() {
 
         {error ? <div className="error-banner">{error}</div> : null}
 
-        <section className="mode-bar card">
-          <div className="mode-title-block">
-            <strong>Files</strong>
-            <span className="panel-subtitle">Updates and commits are not separate views yet, so I removed the fake tabs.</span>
-          </div>
-          <div className="diff-toolbar">
-            <div className="toolbar-chip">All Changes</div>
-            <div className="toolbar-chip">{visibleFilePaths.length} changed files</div>
-            <div className="toolbar-chip">Checkpoint {selectedCheckpointId ?? "none"}</div>
-            {diffViewMode !== "summary" ? (
-              <button
-                onClick={() => {
-                  setDiffViewMode("summary");
-                  setFileSnapshot(null);
-                }}
-                type="button"
-              >
-                Back to Files
-              </button>
-            ) : null}
-            <select value={diffViewMode} onChange={(event) => setDiffViewMode(event.target.value as DiffViewMode)}>
-              <option value="summary">Summary view</option>
-              <option value="unified">Unified diff</option>
-              <option value="side-by-side">Side-by-side</option>
-              <option value="snapshot">File snapshot</option>
-            </select>
-          </div>
-        </section>
-
         <section className="content-grid">
           <section className="card files-card">
             <div className="section-heading">
               <h2>Changed Files</h2>
-              <span>{visibleFilePaths.length} file{visibleFilePaths.length === 1 ? "" : "s"}</span>
+              <span>{reviewFiles.length} file{reviewFiles.length === 1 ? "" : "s"}</span>
             </div>
             {visibleFilePaths.length > 0 ? (
-              <div className="file-selector-list">
+              <div className="card-scroll file-selector-list">
                 {visibleFilePaths.map((filePath) => (
                   <button
                     key={filePath}
                     className={`file-selector${filePath === selectedFilePath ? " active" : ""}`}
-                    onClick={() => setSelectedFilePath(filePath)}
+                    onClick={() => jumpToReviewedFile(filePath)}
                     type="button"
                   >
                     {filePath}
@@ -596,14 +636,16 @@ export function App() {
               </button>
             </div>
             {diffViewMode === "summary" ? (
-              parsedFiles.length > 0 ? (
-                <div className="summary-file-list">{parsedFiles.map((file) => renderSummaryCard(file))}</div>
+              reviewFiles.length > 0 ? (
+                <div className="card-scroll summary-file-list" ref={summaryListRef}>
+                  {reviewFiles.map((file) => renderSummaryCard(file))}
+                </div>
               ) : (
                 <pre>{diffText || "No net patch is available for this checkpoint versus its parent. The Changed Files list still reflects the checkpoint metadata."}</pre>
               )
             ) : diffViewMode === "snapshot" ? (
               selectedFile ? (
-                <div className="snapshot-grid">
+                <div className="card-scroll snapshot-grid">
                   <div className="snapshot-pane">
                     <div className="diff-header">
                       <span>Before snapshot</span>
@@ -621,7 +663,7 @@ export function App() {
                 <pre>Select a file to inspect its full before/after snapshot.</pre>
               )
             ) : selectedFile ? (
-              <div className="diff-view-shell">
+              <div className="card-scroll diff-view-shell">
                 <div className="diff-header">
                   <span>
                     {diffViewMode === "side-by-side"
@@ -635,13 +677,15 @@ export function App() {
                 </div>
                 {diffViewMode === "side-by-side" ? (
                   <div className="side-by-side-table">
-                    {selectedFile.sideBySideRows.map((row, index) =>
+                    {selectedFile.sideBySideRows.filter((row) => row.kind !== "meta").map((row, index) =>
                       renderSideBySideRow(row, `${selectedFile.filePath}-side-${index}`)
                     )}
                   </div>
                 ) : (
                   <div className="unified-table">
-                    {selectedFile.lines.map((line, index) => renderUnifiedLine(line, `${selectedFile.filePath}-line-${index}`))}
+                    {selectedFile.lines
+                      .filter((line) => line.kind !== "meta")
+                      .map((line, index) => renderUnifiedLine(line, `${selectedFile.filePath}-line-${index}`))}
                   </div>
                 )}
               </div>
@@ -657,6 +701,35 @@ export function App() {
             </div>
             <pre>{previewText}</pre>
           </section>
+        </section>
+
+        <section className="mode-bar card">
+          <div className="mode-title-block">
+            <strong>Files</strong>
+            <span className="panel-subtitle">Updates and commits are not separate views yet, so I removed the fake tabs.</span>
+          </div>
+          <div className="diff-toolbar">
+            <div className="toolbar-chip">All Changes</div>
+            <div className="toolbar-chip">{reviewFiles.length} changed files</div>
+            <div className="toolbar-chip">Checkpoint {selectedCheckpointId ?? "none"}</div>
+            {diffViewMode !== "summary" ? (
+              <button
+                onClick={() => {
+                  setDiffViewMode("summary");
+                  setFileSnapshot(null);
+                }}
+                type="button"
+              >
+                Back to Files
+              </button>
+            ) : null}
+            <select value={diffViewMode} onChange={(event) => setDiffViewMode(event.target.value as DiffViewMode)}>
+              <option value="summary">Summary view</option>
+              <option value="unified">Unified diff</option>
+              <option value="side-by-side">Side-by-side</option>
+              <option value="snapshot">File snapshot</option>
+            </select>
+          </div>
         </section>
       </main>
     </div>

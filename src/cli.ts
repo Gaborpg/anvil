@@ -16,6 +16,8 @@ function printHelp(): void {
 
 Usage:
   anvil init
+  anvil uninstall
+  anvil compact --mode keep-last|squash
   anvil review [--port 4312]
   anvil timeline
   anvil checkpoint --summary "summary" [--kind after_edit_batch] [--command "npm test"] [--test-status passed|failed|unknown]
@@ -68,10 +70,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  await store.init();
-
   switch (command) {
     case "init": {
+      await store.init();
       const config = await store.loadConfig();
       console.log(`Anvil initialized for ${repositoryRoot}`);
       console.log(`State directory: ${path.dirname(config.shadowGitDir)}`);
@@ -80,7 +81,32 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "uninstall": {
+      await store.uninstall();
+      console.log(`Removed Anvil state from ${repositoryRoot}`);
+      return;
+    }
+
+    case "compact": {
+      await store.init();
+      const mode = (optionValue(args, "--mode") ?? "keep-last") as "keep-last" | "squash";
+      if (mode !== "keep-last" && mode !== "squash") {
+        throw new Error('compact requires --mode keep-last or --mode squash');
+      }
+
+      const result = await store.compactBranchHistory(mode);
+      if (!result) {
+        console.log("No Anvil checkpoints exist on the current branch.");
+        return;
+      }
+
+      console.log(`Compacted Anvil history on ${result.gitBranch ?? "unknown"} using mode ${mode}.`);
+      console.log(`Retained checkpoint: ${result.checkpointId}`);
+      return;
+    }
+
     case "review": {
+      await store.init();
       const port = optionValue(args, "--port") ?? process.env.ANVIL_PORT ?? "4312";
       const serverScript = path.join(__dirname, "server.js");
       console.log(`Starting Anvil review app for ${repositoryRoot}`);
@@ -104,6 +130,7 @@ async function main(): Promise<void> {
     }
 
     case "timeline": {
+      await store.init();
       const timeline = await store.timeline();
       const checkpoints = timeline.checkpoints;
       if (checkpoints.length === 0) {
@@ -123,6 +150,7 @@ async function main(): Promise<void> {
     }
 
     case "checkpoint": {
+      await store.init();
       const summary = optionValue(args, "--summary");
       if (!summary) {
         throw new Error('checkpoint requires --summary "summary"');
@@ -162,6 +190,7 @@ async function main(): Promise<void> {
     }
 
     case "diff": {
+      await store.init();
       const [fromId, toId] = args;
       const diff = await store.diff(fromId, toId);
       console.log(diff);
@@ -169,6 +198,7 @@ async function main(): Promise<void> {
     }
 
     case "restore": {
+      await store.init();
       const checkpointId = args[0];
       if (!checkpointId) {
         throw new Error("restore requires a checkpoint id");
@@ -180,6 +210,7 @@ async function main(): Promise<void> {
     }
 
     case "explain": {
+      await store.init();
       const checkpointId = args[0];
       if (!checkpointId) {
         throw new Error("explain requires a checkpoint id");
@@ -209,6 +240,7 @@ async function main(): Promise<void> {
     }
 
     case "assign-branch": {
+      await store.init();
       const checkpointId = args[0];
       const branch = args[1] ?? (await store.currentBranch());
       if (!checkpointId) {
@@ -224,6 +256,7 @@ async function main(): Promise<void> {
     }
 
     case "export": {
+      await store.init();
       const previewOnly = args.includes("--preview");
       const message = optionValue(args, "--message") ?? "AI export";
       const result = await store.exportToGit(message, previewOnly);
@@ -232,6 +265,7 @@ async function main(): Promise<void> {
     }
 
     case "__record": {
+      await store.init();
       const kind = optionValue(args, "--kind");
       const summary = optionValue(args, "--summary");
       if (!kind || !summary) {
