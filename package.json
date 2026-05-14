@@ -1,0 +1,36 @@
+{
+  "name": "anvil",
+  "version": "0.1.0",
+  "description": "Local Anvil checkpoint and export CLI backed by a hidden shadow Git repository.",
+  "type": "module",
+  "bin": {
+    "anvil": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:web": "vite build",
+    "build:all": "npm run build && npm run build:web",
+    "start": "node ./dist/cli.js",
+    "dev": "node --loader ts-node/esm ./src/cli.ts",
+    "dev:server": "node --loader ts-node/esm ./src/server.ts",
+    "dev:web": "vite",
+    "dev:app": "node ./dist/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "@types/cors": "^2.8.19",
+    "@vitejs/plugin-react": "^5.0.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3",
+    "vite": "^7.1.7"
+  }
+}
