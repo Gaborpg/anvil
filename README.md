@@ -89,6 +89,15 @@ Initialize Anvil explicitly:
 anvil init
 ```
 
+`anvil init` now bootstraps all the basic repo-local Anvil wiring:
+- `.anvil/config.json`
+- `.anvil/metadata.jsonl`
+- `.anvil/store.git`
+- `.anvil/hooks.yaml`
+- `.github/hooks/anvil-copilot.json`
+
+The Copilot hook is installed, but auto-checkpointing stays disabled until you set `autoCheckpoint: true` in `.anvil/hooks.yaml`.
+
 Or skip that and just use any normal Anvil command. Most commands auto-initialize `.anvil/` on first use.
 
 ## Start The Review App
@@ -196,11 +205,13 @@ VS Code Copilot hooks use workspace JSON files under:
 .github/hooks/
 ```
 
-Install Anvil's VS Code Copilot hook file into the current repo:
+Install or refresh Anvil's VS Code Copilot hook file into the current repo:
 
 ```bash
 anvil install-copilot-hook
 ```
+
+`anvil init` already does this automatically, so you usually only need `install-copilot-hook` if you want to recreate or refresh the hook files later.
 
 That creates:
 

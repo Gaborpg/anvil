@@ -141,6 +141,25 @@ export async function loadHookConfig(repositoryRoot: string): Promise<HookConfig
   return parseHooksYaml(content);
 }
 
+export async function ensureHookConfigTemplate(repositoryRoot: string): Promise<string> {
+  const filePath = hookConfigPath(repositoryRoot);
+  if (existsSync(filePath)) {
+    return filePath;
+  }
+
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const content = `# Optional Anvil repo-local hook config
+copilot:
+  autoCheckpoint: false
+  summary: "Copilot file changes"
+  kind: after_edit_batch
+  command: copilot
+  testStatus: unknown
+`;
+  await writeFile(filePath, content, "utf8");
+  return filePath;
+}
+
 export function vscodeCopilotHookConfigPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, VSCODE_HOOKS_DIR, VSCODE_COPILOT_HOOK_FILE_NAME);
 }

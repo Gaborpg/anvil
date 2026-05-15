@@ -4,7 +4,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { installVSCodeCopilotHook, isCopilotFileEditEvent, loadHookConfig, type VSCodeHookInput } from "./hooks.js";
+import {
+  ensureHookConfigTemplate,
+  installVSCodeCopilotHook,
+  isCopilotFileEditEvent,
+  loadHookConfig,
+  type VSCodeHookInput
+} from "./hooks.js";
 import { CheckpointStore } from "./store.js";
 import type { CheckpointKind } from "./types.js";
 import { formatTimestamp } from "./utils.js";
@@ -105,17 +111,24 @@ async function main(): Promise<void> {
     case "init": {
       await store.init();
       const config = await store.loadConfig();
+      const hookPath = await installVSCodeCopilotHook(repositoryRoot);
+      const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
       console.log(`Anvil initialized for ${repositoryRoot}`);
       console.log(`State directory: ${path.dirname(config.shadowGitDir)}`);
       console.log(`Shadow store: ${config.shadowGitDir}`);
       console.log(`Metadata: ${config.metadataFile}`);
+      console.log(`Copilot hook: ${hookPath}`);
+      console.log(`Hook config: ${hookConfigPath}`);
+      console.log("Copilot auto-checkpoint remains disabled until you set autoCheckpoint: true in .anvil/hooks.yaml.");
       return;
     }
 
     case "install-copilot-hook": {
       await store.init();
       const hookPath = await installVSCodeCopilotHook(repositoryRoot);
+      const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
       console.log(`Installed VS Code Copilot hook at ${hookPath}`);
+      console.log(`Hook config: ${hookConfigPath}`);
       console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Copilot file edits.");
       return;
     }
