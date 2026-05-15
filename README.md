@@ -175,6 +175,7 @@ anvil review [--port 4312]
 anvil checkpoint --summary "Updated parser logic"
 anvil hook codex-after-edit
 anvil hook copilot-after-edit
+anvil hook status
 anvil timeline
 anvil diff [checkpoint] [checkpoint]
 anvil restore <checkpoint>
@@ -388,6 +389,33 @@ Important:
 - this hook is disabled unless `.anvil/hooks.yaml` explicitly enables it
 - it targets `PostToolUse` for `apply_patch`, `Edit`, and `Write`
 - it creates an Anvil checkpoint, not a real Git commit
+
+## Hook Status
+
+If you want to quickly check whether your repo is wired correctly for hook-based auto-checkpointing:
+
+```bash
+anvil hook status
+```
+
+or:
+
+```bash
+anvil hook doctor
+```
+
+This reports:
+- resolved repo root
+- launched-from folder if different
+- current branch
+- whether `.anvil/hooks.yaml` exists
+- whether Copilot and Codex auto-checkpointing are enabled
+- whether `.github/hooks/anvil-copilot.json` exists
+- whether `.codex/hooks.json` exists
+- whether `.anvilignore` exists
+- the last recorded hook execution, including whether it was ignored, disabled, had no changes, or created a checkpoint
+
+This is the fastest way to debug “why didn’t the hook run?” before chasing editor-specific behavior.
 
 ## Timeline
 

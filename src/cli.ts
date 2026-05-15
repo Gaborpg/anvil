@@ -2,17 +2,23 @@
 import process from "node:process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
+  appendHookExecutionLog,
   type CodexHookInput,
+  codexHookConfigPath,
   ensureHookConfigTemplate,
   extractHookFilePaths,
+  hookConfigPath,
   installCodexHook,
   installVSCodeCopilotHook,
   isCodexFileEditEvent,
   isCopilotFileEditEvent,
   loadHookConfig,
+  readLastHookExecutionLog,
+  vscodeCopilotHookConfigPath,
   type VSCodeHookInput
 } from "./hooks.js";
 import { getRepositoryRoot } from "./git.js";
@@ -42,6 +48,8 @@ Usage:
   anvil compact --mode keep-last|squash
   anvil hook copilot-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "copilot"] [--test-status passed|failed|unknown] [--vscode-hook]
   anvil hook codex-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "codex"] [--test-status passed|failed|unknown] [--codex-hook]
+  anvil hook status
+  anvil hook doctor
   anvil review [--port 4312]
   anvil timeline
   anvil checkpoint --summary "summary" [--kind after_edit_batch] [--command "npm test"] [--test-status passed|failed|unknown] [--only path/a,path/b]
@@ -156,6 +164,75 @@ function printRepositoryContext(repositoryRoot: string, launchCwd: string, branc
   console.log(`Branch: ${branch}`);
 }
 
+function formatStatusLine(label: string, value: string): string {
+  return `${label}: ${value}`;
+}
+
+async function printHookStatus(
+  repositoryRoot: string,
+  launchCwd: string,
+  store: CheckpointStore,
+  ignoreRules?: AnvilIgnoreRules
+): Promise<void> {
+  const branch = await resolvedBranchLabel(store);
+  const config = await loadHookConfig(repositoryRoot);
+  const hookConfigFile = hookConfigPath(repositoryRoot);
+  const copilotHookFile = vscodeCopilotHookConfigPath(repositoryRoot);
+  const codexHookFile = codexHookConfigPath(repositoryRoot);
+  const anvilIgnoreFile = path.join(repositoryRoot, ".anvilignore");
+  const ignorePatternCount = ignoreRules?.patterns.length ?? 0;
+
+  const copilotReady = existsSync(copilotHookFile) && Boolean(config.copilot?.autoCheckpoint);
+  const codexReady = existsSync(codexHookFile) && Boolean(config.codex?.autoCheckpoint);
+  const lastHookExecution = await readLastHookExecutionLog(repositoryRoot);
+
+  console.log("Anvil hook status\n");
+  printRepositoryContext(repositoryRoot, launchCwd, branch);
+  console.log("");
+  console.log("Hook config");
+  console.log(`  ${formatStatusLine(".anvil/hooks.yaml", existsSync(hookConfigFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine("copilot.autoCheckpoint", String(config.copilot?.autoCheckpoint ?? false))}`);
+  console.log(`  ${formatStatusLine("codex.autoCheckpoint", String(config.codex?.autoCheckpoint ?? false))}`);
+  console.log("");
+  console.log("Installed hook files");
+  console.log(`  ${formatStatusLine(".github/hooks/anvil-copilot.json", existsSync(copilotHookFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".codex/hooks.json", existsSync(codexHookFile) ? "present" : "missing")}`);
+  console.log("");
+  console.log("Ignore rules");
+  console.log(`  ${formatStatusLine(".anvilignore", existsSync(anvilIgnoreFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine("active custom ignore patterns", String(ignorePatternCount))}`);
+  console.log("");
+  console.log("Ready state");
+  console.log(`  ${formatStatusLine("Copilot hook ready", copilotReady ? "yes" : "no")}`);
+  console.log(`  ${formatStatusLine("Codex hook ready", codexReady ? "yes" : "no")}`);
+  console.log("");
+  console.log("Last hook execution");
+  if (lastHookExecution) {
+    console.log(`  ${formatStatusLine("time", lastHookExecution.timestamp)}`);
+    console.log(`  ${formatStatusLine("hook", lastHookExecution.hookName)}`);
+    console.log(`  ${formatStatusLine("mode", lastHookExecution.mode)}`);
+    console.log(`  ${formatStatusLine("status", lastHookExecution.status)}`);
+    if (lastHookExecution.branch) {
+      console.log(`  ${formatStatusLine("branch", lastHookExecution.branch)}`);
+    }
+    if (lastHookExecution.checkpointId) {
+      console.log(`  ${formatStatusLine("checkpoint", lastHookExecution.checkpointId)}`);
+    }
+    if (lastHookExecution.files?.length) {
+      console.log(`  ${formatStatusLine("files", lastHookExecution.files.join(", "))}`);
+    }
+    if (lastHookExecution.message) {
+      console.log(`  ${formatStatusLine("message", lastHookExecution.message)}`);
+    }
+  } else {
+    console.log("  none");
+  }
+  console.log("");
+  console.log("Notes");
+  console.log("  Hooks only auto-checkpoint when the host actually executes them and autoCheckpoint is true.");
+  console.log("  If a hook looks installed but nothing fires, verify the editor/agent supports repo hooks in that session.");
+}
+
 async function main(): Promise<void> {
   const [, , command, ...args] = process.argv;
   const launchCwd = process.cwd();
@@ -258,12 +335,17 @@ async function main(): Promise<void> {
     case "hook": {
       await store.init();
       const hookName = args[0];
+      if (hookName === "status" || hookName === "doctor") {
+        await printHookStatus(repositoryRoot, launchCwd, store, ignoreRules);
+        return;
+      }
       if (hookName !== "copilot-after-edit" && hookName !== "codex-after-edit") {
-        throw new Error("Unknown hook. Supported hooks: copilot-after-edit, codex-after-edit");
+        throw new Error("Unknown hook. Supported hooks: status, doctor, copilot-after-edit, codex-after-edit");
       }
 
       const vscodeHookMode = args.includes("--vscode-hook");
       const codexHookMode = args.includes("--codex-hook");
+      const hookMode = vscodeHookMode ? "vscode-hook" : codexHookMode ? "codex-hook" : "cli";
       const stdInText = vscodeHookMode || codexHookMode ? await readStdInText() : "";
       let vscodeHookInput: VSCodeHookInput | null = null;
       let codexHookInput: CodexHookInput | null = null;
@@ -271,6 +353,13 @@ async function main(): Promise<void> {
         try {
           vscodeHookInput = JSON.parse(stdInText) as VSCodeHookInput;
         } catch {
+          await appendHookExecutionLog(repositoryRoot, {
+            timestamp: new Date().toISOString(),
+            hookName,
+            status: "invalid_payload",
+            mode: hookMode,
+            message: "Could not parse VS Code hook payload."
+          });
           emitVSCodeHookResponse();
           return;
         }
@@ -279,21 +368,50 @@ async function main(): Promise<void> {
         try {
           codexHookInput = JSON.parse(stdInText) as CodexHookInput;
         } catch {
+          await appendHookExecutionLog(repositoryRoot, {
+            timestamp: new Date().toISOString(),
+            hookName,
+            status: "invalid_payload",
+            mode: hookMode,
+            message: "Could not parse Codex hook payload."
+          });
           return;
         }
       }
 
       if (vscodeHookMode && !isCopilotFileEditEvent(vscodeHookInput)) {
+        await appendHookExecutionLog(repositoryRoot, {
+          timestamp: new Date().toISOString(),
+          hookName,
+          status: "ignored",
+          mode: hookMode,
+          message: "Hook payload was not a Copilot file-edit event."
+        });
         emitVSCodeHookResponse();
         return;
       }
       if (codexHookMode && !isCodexFileEditEvent(codexHookInput)) {
+        await appendHookExecutionLog(repositoryRoot, {
+          timestamp: new Date().toISOString(),
+          hookName,
+          status: "ignored",
+          mode: hookMode,
+          message: "Hook payload was not a Codex file-edit event."
+        });
         return;
       }
 
       const config = await loadHookConfig(repositoryRoot);
       const hookConfig = hookName === "copilot-after-edit" ? config.copilot : config.codex;
       if (!hookConfig?.autoCheckpoint) {
+        await appendHookExecutionLog(repositoryRoot, {
+          timestamp: new Date().toISOString(),
+          hookName,
+          status: "disabled",
+          mode: hookMode,
+          branch: await resolvedBranchLabel(store),
+          message: "autoCheckpoint is disabled in .anvil/hooks.yaml."
+        });
         if (vscodeHookMode) {
           emitVSCodeHookResponse();
           return;
@@ -319,6 +437,14 @@ async function main(): Promise<void> {
       const files = [...new Set(filterIgnoredAnvilPaths([...hookFiles, ...statusFiles], ignoreRules))];
 
       if (files.length === 0) {
+        await appendHookExecutionLog(repositoryRoot, {
+          timestamp: new Date().toISOString(),
+          hookName,
+          status: "no_changes",
+          mode: hookMode,
+          branch: await resolvedBranchLabel(store),
+          message: "No Git-detected workspace changes were available to checkpoint."
+        });
         if (vscodeHookMode) {
           emitVSCodeHookResponse();
           return;
@@ -336,6 +462,17 @@ async function main(): Promise<void> {
         filesChanged: files,
         commandsRun: commandValue ? [commandValue] : [],
         testStatus
+      });
+
+      await appendHookExecutionLog(repositoryRoot, {
+        timestamp: new Date().toISOString(),
+        hookName,
+        status: "recorded",
+        mode: hookMode,
+        branch: checkpoint.gitBranch ?? "unknown",
+        checkpointId: checkpoint.checkpointId,
+        files: checkpoint.filesChanged,
+        message: `Recorded ${checkpoint.checkpointId}.`
       });
 
       if (vscodeHookMode) {

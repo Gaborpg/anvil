@@ -1,6 +1,6 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import type { CheckpointKind } from "./types.js";
 
 export interface CopilotHookConfig {
@@ -35,7 +35,19 @@ export interface CodexHookInput {
   };
 }
 
+export interface HookExecutionLogEntry {
+  timestamp: string;
+  hookName: "copilot-after-edit" | "codex-after-edit";
+  status: "invalid_payload" | "ignored" | "disabled" | "no_changes" | "recorded";
+  mode: "cli" | "vscode-hook" | "codex-hook";
+  branch?: string;
+  checkpointId?: string;
+  files?: string[];
+  message?: string;
+}
+
 const HOOKS_FILE_NAME = "hooks.yaml";
+const HOOK_EXECUTION_LOG_FILE_NAME = "hook-executions.jsonl";
 const VSCODE_HOOKS_DIR = path.join(".github", "hooks");
 const VSCODE_COPILOT_HOOK_FILE_NAME = "anvil-copilot.json";
 const CODEX_HOOKS_DIR = path.join(".codex");
@@ -56,6 +68,10 @@ const FILE_EDIT_TOOL_NAMES = new Set([
 
 export function hookConfigPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, ".anvil", HOOKS_FILE_NAME);
+}
+
+export function hookExecutionLogPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", HOOK_EXECUTION_LOG_FILE_NAME);
 }
 
 function stripQuotes(value: string): string {
@@ -177,6 +193,40 @@ codex:
 `;
   await writeFile(filePath, content, "utf8");
   return filePath;
+}
+
+export async function appendHookExecutionLog(
+  repositoryRoot: string,
+  entry: HookExecutionLogEntry
+): Promise<void> {
+  const filePath = hookExecutionLogPath(repositoryRoot);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf8");
+}
+
+export async function readLastHookExecutionLog(
+  repositoryRoot: string
+): Promise<HookExecutionLogEntry | null> {
+  const filePath = hookExecutionLogPath(repositoryRoot);
+  if (!existsSync(filePath)) {
+    return null;
+  }
+
+  const content = await readFile(filePath, "utf8");
+  const lines = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const lastLine = lines.at(-1);
+  if (!lastLine) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(lastLine) as HookExecutionLogEntry;
+  } catch {
+    return null;
+  }
 }
 
 export function vscodeCopilotHookConfigPath(repositoryRoot: string): string {
