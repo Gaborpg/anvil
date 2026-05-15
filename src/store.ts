@@ -2,6 +2,7 @@ import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { getCurrentBranch, getHeadReflogMessages, getOriginUrl, runGit, runGitRaw } from "./git.js";
+import { filterIgnoredAnvilPaths, isIgnoredAnvilPath, loadAnvilIgnoreRules, type AnvilIgnoreRules } from "./ignore.js";
 import type { CheckpointMetadata, FileSnapshotResponse, RecordCheckpointOptions, StoreConfig, TimelineResponse } from "./types.js";
 import { checkpointNumber, ensureDir, hashText, readJson, writeJson } from "./utils.js";
 
@@ -31,6 +32,8 @@ interface ChangedPathSet {
 export class CheckpointStore {
   constructor(private readonly repositoryRoot: string) {}
 
+  private ignoreRulesPromise: Promise<AnvilIgnoreRules> | null = null;
+
   get baseDir(): string {
     return path.join(this.repositoryRoot, STORE_DIR_NAME);
   }
@@ -45,6 +48,14 @@ export class CheckpointStore {
 
   get configFile(): string {
     return path.join(this.baseDir, CONFIG_FILE_NAME);
+  }
+
+  private async ignoreRules(): Promise<AnvilIgnoreRules> {
+    if (!this.ignoreRulesPromise) {
+      this.ignoreRulesPromise = loadAnvilIgnoreRules(this.repositoryRoot);
+    }
+
+    return this.ignoreRulesPromise;
   }
 
   async init(): Promise<StoreConfig> {
@@ -98,6 +109,7 @@ export class CheckpointStore {
   }
 
   private async workspaceStatusEntries(): Promise<WorkspaceStatusEntry[]> {
+    const ignoreRules = await this.ignoreRules();
     const output = await runGitRaw(["status", "--porcelain=v1", "-z"], this.repositoryRoot);
     if (!output) {
       return [];
@@ -111,13 +123,13 @@ export class CheckpointStore {
       const status = token.slice(0, 2);
       const filePath = token.slice(3);
 
-      if (!filePath || filePath.startsWith(".anvil")) {
+      if (!filePath || isIgnoredAnvilPath(filePath, ignoreRules)) {
         continue;
       }
 
       if (status.startsWith("R") || status.startsWith("C")) {
         const renamedTo = tokens[index + 1];
-        if (renamedTo && !renamedTo.startsWith(".anvil")) {
+        if (renamedTo && !isIgnoredAnvilPath(renamedTo, ignoreRules)) {
           entries.push({ path: renamedTo });
         }
         index += 1;
@@ -131,9 +143,10 @@ export class CheckpointStore {
   }
 
   private async stageWorkspacePaths(explicitPaths?: string[]): Promise<string[]> {
+    const ignoreRules = await this.ignoreRules();
     const candidatePaths =
       explicitPaths && explicitPaths.length > 0
-        ? explicitPaths.filter((file) => file.length > 0 && !file.startsWith(".anvil"))
+        ? filterIgnoredAnvilPaths(explicitPaths, ignoreRules)
         : (await this.workspaceStatusEntries()).map((entry) => entry.path);
 
     const uniquePaths = [...new Set(candidatePaths)];
@@ -154,6 +167,7 @@ export class CheckpointStore {
   }
 
   private async workspaceSnapshotPaths(): Promise<string[]> {
+    const ignoreRules = await this.ignoreRules();
     const output = await runGitRaw(
       ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
       this.repositoryRoot
@@ -162,13 +176,14 @@ export class CheckpointStore {
       return [];
     }
 
-    return [...new Set(output.split("\0").filter((item) => item.length > 0 && !item.startsWith(".anvil")))];
+    return [...new Set(filterIgnoredAnvilPaths(output.split("\0").filter((item) => item.length > 0), ignoreRules))];
   }
 
   private async shadowTreePaths(commitish = "HEAD"): Promise<string[]> {
+    const ignoreRules = await this.ignoreRules();
     try {
       const output = await runGitRaw(["ls-tree", "-r", "--name-only", "-z", commitish], this.repositoryRoot, this.shadowGitDir);
-      return output.split("\0").filter((item) => item.length > 0 && !item.startsWith(".anvil"));
+      return filterIgnoredAnvilPaths(output.split("\0").filter((item) => item.length > 0), ignoreRules);
     } catch {
       return [];
     }
@@ -192,6 +207,7 @@ export class CheckpointStore {
   }
 
   private async changedPathsBetween(fromCommit: string | null, toCommit: string): Promise<ChangedPathSet> {
+    const ignoreRules = await this.ignoreRules();
     const checkout = new Set<string>();
     const remove = new Set<string>();
     const output = await runGitRaw(
@@ -216,17 +232,17 @@ export class CheckpointStore {
       if (code === "R" || code === "C") {
         const oldPath = tokens[index++];
         const newPath = tokens[index++];
-        if (oldPath && !oldPath.startsWith(".anvil")) {
+        if (oldPath && !isIgnoredAnvilPath(oldPath, ignoreRules)) {
           remove.add(oldPath);
         }
-        if (newPath && !newPath.startsWith(".anvil")) {
+        if (newPath && !isIgnoredAnvilPath(newPath, ignoreRules)) {
           checkout.add(newPath);
         }
         continue;
       }
 
       const filePath = tokens[index++];
-      if (!filePath || filePath.startsWith(".anvil")) {
+      if (!filePath || isIgnoredAnvilPath(filePath, ignoreRules)) {
         continue;
       }
 
@@ -250,8 +266,9 @@ export class CheckpointStore {
   }
 
   private async removeWorkspacePaths(paths: string[]): Promise<void> {
+    const ignoreRules = await this.ignoreRules();
     for (const relativePath of paths) {
-      if (!relativePath || relativePath.startsWith(".anvil")) {
+      if (!relativePath || isIgnoredAnvilPath(relativePath, ignoreRules)) {
         continue;
       }
 
@@ -489,7 +506,12 @@ export class CheckpointStore {
 
     const parent = await this.latestCheckpointForBranch(gitBranch);
     const shadowContext = await this.ensureShadowBranch(gitBranch);
-    const snapshotPaths = await this.stageFullWorkspaceSnapshot();
+    const snapshotMode = options.snapshotMode ?? "full";
+    if (snapshotMode === "partial") {
+      await this.stageWorkspacePaths(options.filesChanged);
+    } else {
+      await this.stageFullWorkspaceSnapshot();
+    }
 
     const commitMessage = `${checkpointId} ${options.kind}: ${options.summary}`;
     try {
@@ -515,14 +537,14 @@ export class CheckpointStore {
     const changesSinceParent = await this.changedPathsBetween(parent?.shadowCommitSha ?? null, shadowCommitSha);
     const filesChanged =
       options.filesChanged && options.filesChanged.length > 0
-        ? [...new Set(options.filesChanged.filter((file) => file.length > 0 && !file.startsWith(".anvil")))]
+        ? [...new Set(filterIgnoredAnvilPaths(options.filesChanged, await this.ignoreRules()))]
         : [...new Set([...changesSinceParent.checkout, ...changesSinceParent.remove])];
 
     const metadata: CheckpointMetadata = {
       checkpointId,
       timestamp: new Date().toISOString(),
       kind: options.kind,
-      snapshotMode: "full",
+      snapshotMode,
       gitBranch,
       shadowRef: shadowContext.shadowRef,
       parentCheckpointId: parent?.checkpointId ?? null,

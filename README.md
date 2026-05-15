@@ -139,8 +139,9 @@ anvil init
 - `.anvil/store.git`
 - `.anvil/hooks.yaml`
 - `.github/hooks/anvil-copilot.json`
+- `.codex/hooks.json`
 
-The Copilot hook is installed, but auto-checkpointing stays disabled until you set `autoCheckpoint: true` in `.anvil/hooks.yaml`.
+The Copilot and Codex hooks are installed, but auto-checkpointing stays disabled until you set `autoCheckpoint: true` in `.anvil/hooks.yaml`.
 
 Or skip that and just use any normal Anvil command. Most commands auto-initialize `.anvil/` on first use.
 
@@ -168,9 +169,11 @@ anvil review --port 4313
 
 ```bash
 anvil init
+anvil install-codex-hook
 anvil install-copilot-hook
 anvil review [--port 4312]
 anvil checkpoint --summary "Updated parser logic"
+anvil hook codex-after-edit
 anvil hook copilot-after-edit
 anvil timeline
 anvil diff [checkpoint] [checkpoint]
@@ -229,6 +232,12 @@ Create a checkpoint:
 anvil checkpoint --summary "Updated parser logic"
 ```
 
+Create a scoped checkpoint for only specific files:
+
+```bash
+anvil checkpoint --summary "Updated parser logic" --only src/parser.ts,src/tokenizer.ts
+```
+
 Checkpoint after tests:
 
 ```bash
@@ -240,6 +249,36 @@ anvil checkpoint \
 ```
 
 If there are no workspace changes, Anvil will tell you and skip creating an empty checkpoint.
+
+When you use `--only`, Anvil creates a partial checkpoint scoped to those paths instead of bundling every dirty file in the repo into one checkpoint.
+
+By default, Anvil also ignores a few of its own common temp/log files so they do not pollute checkpoints:
+- `anvil-server.err.log`
+- `anvil-server.out.log`
+- `anvil-restore-smoke.txt`
+
+You can add your own Anvil-specific ignore rules in:
+
+```text
+.anvilignore
+```
+
+Example:
+
+```text
+# Ignore local temp files for Anvil only
+*.tmp
+coverage/
+dist/
+my-local-note.txt
+```
+
+This affects:
+- normal checkpoints
+- hook checkpoints
+- full snapshot staging
+
+It does not change your normal Git ignore rules.
 
 ## Copilot Auto-Checkpoint Hook
 
@@ -304,6 +343,51 @@ Important:
 - if there are no file changes, Anvil will skip the checkpoint
 - this creates an Anvil checkpoint, not a real Git commit
 - the hook is safe to keep repo-local because it lives under `.anvil/`
+
+## Codex Auto-Checkpoint Hook
+
+Codex uses repo-local hook config in:
+
+```text
+.codex/hooks.json
+```
+
+Install or refresh Anvil's Codex hook file into the current repo:
+
+```bash
+anvil install-codex-hook
+```
+
+`anvil init` already does this automatically, so you usually only need `install-codex-hook` if you want to recreate or refresh the hook later.
+
+That creates:
+
+```text
+.codex/hooks.json
+```
+
+The installed hook listens for Codex `PostToolUse` on `apply_patch` edits and calls:
+
+```bash
+anvil hook codex-after-edit --codex-hook
+```
+
+To enable it, turn on the repo-local Anvil hook config:
+
+```yaml
+codex:
+  autoCheckpoint: true
+  summary: "Codex file changes"
+  kind: after_edit_batch
+  command: codex
+  testStatus: unknown
+```
+
+Important:
+- Codex discovers the hook from `.codex/hooks.json`
+- this hook is disabled unless `.anvil/hooks.yaml` explicitly enables it
+- it targets `PostToolUse` for `apply_patch`, `Edit`, and `Write`
+- it creates an Anvil checkpoint, not a real Git commit
 
 ## Timeline
 

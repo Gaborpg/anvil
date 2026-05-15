@@ -13,6 +13,7 @@ export interface CopilotHookConfig {
 
 export interface HookConfig {
   copilot?: CopilotHookConfig;
+  codex?: CopilotHookConfig;
 }
 
 export interface VSCodeHookInput {
@@ -26,10 +27,21 @@ export interface VSCodeHookInput {
   };
 }
 
+export interface CodexHookInput {
+  hook_event_name?: string;
+  tool_name?: string;
+  tool_input?: {
+    command?: unknown;
+  };
+}
+
 const HOOKS_FILE_NAME = "hooks.yaml";
 const VSCODE_HOOKS_DIR = path.join(".github", "hooks");
 const VSCODE_COPILOT_HOOK_FILE_NAME = "anvil-copilot.json";
+const CODEX_HOOKS_DIR = path.join(".codex");
+const CODEX_HOOKS_FILE_NAME = "hooks.json";
 const ANVIL_INTERNAL_HOOK_PATH = `${VSCODE_HOOKS_DIR.replace(/\\/g, "/")}/${VSCODE_COPILOT_HOOK_FILE_NAME}`;
+const ANVIL_INTERNAL_CODEX_HOOK_PATH = `${CODEX_HOOKS_DIR.replace(/\\/g, "/")}/${CODEX_HOOKS_FILE_NAME}`;
 const FILE_EDIT_TOOL_NAMES = new Set([
   "editFiles",
   "createFile",
@@ -70,7 +82,7 @@ function parseScalar(value: string): string | boolean {
 
 function parseHooksYaml(content: string): HookConfig {
   const result: HookConfig = {};
-  let section: "copilot" | null = null;
+  let section: "copilot" | "codex" | null = null;
 
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.replace(/\t/g, "  ");
@@ -86,9 +98,9 @@ function parseHooksYaml(content: string): HookConfig {
       }
 
       const key = sectionMatch[1];
-      section = key === "copilot" ? "copilot" : null;
-      if (section === "copilot") {
-        result.copilot ??= { autoCheckpoint: false };
+      section = key === "copilot" || key === "codex" ? key : null;
+      if (section === "copilot" || section === "codex") {
+        result[section] ??= { autoCheckpoint: false };
       }
       continue;
     }
@@ -105,8 +117,8 @@ function parseHooksYaml(content: string): HookConfig {
     const [, key, rawValue = ""] = pairMatch;
     const value = parseScalar(rawValue);
 
-    if (section === "copilot") {
-      const config = (result.copilot ??= { autoCheckpoint: false });
+    if (section === "copilot" || section === "codex") {
+      const config = (result[section] ??= { autoCheckpoint: false });
       switch (key) {
         case "autoCheckpoint":
         case "auto_checkpoint":
@@ -156,6 +168,12 @@ copilot:
   kind: after_edit_batch
   command: copilot
   testStatus: unknown
+codex:
+  autoCheckpoint: false
+  summary: "Codex file changes"
+  kind: after_edit_batch
+  command: codex
+  testStatus: unknown
 `;
   await writeFile(filePath, content, "utf8");
   return filePath;
@@ -192,7 +210,12 @@ function normalizeHookFilePath(value: unknown): string | null {
   }
 
   const trimmed = value.trim().replace(/\\/g, "/");
-  if (!trimmed || trimmed.startsWith(".anvil/") || trimmed === ANVIL_INTERNAL_HOOK_PATH) {
+  if (
+    !trimmed ||
+    trimmed.startsWith(".anvil/") ||
+    trimmed === ANVIL_INTERNAL_HOOK_PATH ||
+    trimmed === ANVIL_INTERNAL_CODEX_HOOK_PATH
+  ) {
     return null;
   }
 
@@ -240,6 +263,51 @@ export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<
             type: "command",
             command: "anvil hook copilot-after-edit --vscode-hook",
             timeout: 30
+          }
+        ]
+      }
+    },
+    null,
+    2
+  );
+  await writeFile(hookPath, `${content}\n`, "utf8");
+  return hookPath;
+}
+
+export function codexHookConfigPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, CODEX_HOOKS_DIR, CODEX_HOOKS_FILE_NAME);
+}
+
+export function isCodexFileEditEvent(input: CodexHookInput | null): boolean {
+  if (!input) {
+    return true;
+  }
+
+  if (input.hook_event_name && input.hook_event_name !== "PostToolUse") {
+    return false;
+  }
+
+  const toolName = input.tool_name ?? "";
+  return toolName === "apply_patch" || toolName === "Edit" || toolName === "Write";
+}
+
+export async function installCodexHook(repositoryRoot: string): Promise<string> {
+  const hookPath = codexHookConfigPath(repositoryRoot);
+  await mkdir(path.dirname(hookPath), { recursive: true });
+  const content = JSON.stringify(
+    {
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: "^apply_patch$|^Edit$|^Write$",
+            hooks: [
+              {
+                type: "command",
+                command: "anvil hook codex-after-edit --codex-hook",
+                timeout: 30,
+                statusMessage: "Checkpointing Codex edit in Anvil"
+              }
+            ]
           }
         ]
       }

@@ -5,14 +5,18 @@ import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
+  type CodexHookInput,
   ensureHookConfigTemplate,
   extractHookFilePaths,
+  installCodexHook,
   installVSCodeCopilotHook,
+  isCodexFileEditEvent,
   isCopilotFileEditEvent,
   loadHookConfig,
   type VSCodeHookInput
 } from "./hooks.js";
 import { getRepositoryRoot } from "./git.js";
+import { filterIgnoredAnvilPaths, loadAnvilIgnoreRules, type AnvilIgnoreRules } from "./ignore.js";
 import { CheckpointStore } from "./store.js";
 import type { CheckpointKind } from "./types.js";
 import { formatTimestamp } from "./utils.js";
@@ -31,14 +35,16 @@ function printHelp(): void {
 Usage:
   anvil init
   anvil install -g
+  anvil install-codex-hook
   anvil install-copilot-hook
   anvil uninstall
   anvil uninstall -g
   anvil compact --mode keep-last|squash
   anvil hook copilot-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "copilot"] [--test-status passed|failed|unknown] [--vscode-hook]
+  anvil hook codex-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "codex"] [--test-status passed|failed|unknown] [--codex-hook]
   anvil review [--port 4312]
   anvil timeline
-  anvil checkpoint --summary "summary" [--kind after_edit_batch] [--command "npm test"] [--test-status passed|failed|unknown]
+  anvil checkpoint --summary "summary" [--kind after_edit_batch] [--command "npm test"] [--test-status passed|failed|unknown] [--only path/a,path/b]
   anvil diff [checkpoint] [checkpoint]
   anvil restore <checkpoint>
   anvil explain <checkpoint>
@@ -57,6 +63,17 @@ function optionValue(args: string[], flag: string): string | null {
   }
 
   return args[index + 1];
+}
+
+function parsePathList(value: string | null): string[] {
+  if (!value) {
+    return [];
+  }
+
+  return value
+    .split(",")
+    .map((item) => item.trim().replace(/\\/g, "/"))
+    .filter(Boolean);
 }
 
 async function readStdInText(): Promise<string> {
@@ -106,13 +123,14 @@ async function runStreamingCommand(command: string, args: string[], cwd: string)
   });
 }
 
-async function gitStatusFiles(cwd: string): Promise<string[]> {
+async function gitStatusFiles(cwd: string, ignoreRules?: AnvilIgnoreRules): Promise<string[]> {
   const { stdout } = await execFileAsync("git", ["status", "--short", "--untracked-files=all"], {
     cwd,
     windowsHide: true
   });
 
-  return stdout
+  return filterIgnoredAnvilPaths(
+    stdout
     .replace(/\r?\n$/, "")
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
@@ -121,13 +139,9 @@ async function gitStatusFiles(cwd: string): Promise<string[]> {
       const filePart = line.length >= 4 ? line.slice(3).trim() : line.trim();
       const renameParts = filePart.split(" -> ");
       return renameParts.at(-1)?.trim() ?? filePart.trim();
-    })
-    .filter(
-      (file) =>
-        file.length > 0 &&
-        !file.startsWith(".anvil") &&
-        file !== ".github/hooks/anvil-copilot.json"
-    );
+    }),
+    ignoreRules
+  );
 }
 
 async function resolvedBranchLabel(store: CheckpointStore): Promise<string> {
@@ -154,6 +168,7 @@ async function main(): Promise<void> {
   const globalInstall = command === "install" && (args.includes("-g") || args.includes("--global"));
   const globalUninstall = command === "uninstall" && (args.includes("-g") || args.includes("--global"));
   const repositoryRoot = globalInstall || globalUninstall ? launchCwd : (await getRepositoryRoot(launchCwd)) ?? launchCwd;
+  const ignoreRules = globalInstall || globalUninstall ? undefined : await loadAnvilIgnoreRules(repositoryRoot);
   const store = new CheckpointStore(repositoryRoot);
 
   switch (command) {
@@ -161,14 +176,16 @@ async function main(): Promise<void> {
       await store.init();
       const config = await store.loadConfig();
       const hookPath = await installVSCodeCopilotHook(repositoryRoot);
+      const codexHookPath = await installCodexHook(repositoryRoot);
       const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
       console.log(`Anvil initialized for ${repositoryRoot}`);
       console.log(`State directory: ${path.dirname(config.shadowGitDir)}`);
       console.log(`Shadow store: ${config.shadowGitDir}`);
       console.log(`Metadata: ${config.metadataFile}`);
       console.log(`Copilot hook: ${hookPath}`);
+      console.log(`Codex hook: ${codexHookPath}`);
       console.log(`Hook config: ${hookConfigPath}`);
-      console.log("Copilot auto-checkpoint remains disabled until you set autoCheckpoint: true in .anvil/hooks.yaml.");
+      console.log("Copilot and Codex auto-checkpoint remain disabled until you set autoCheckpoint: true in .anvil/hooks.yaml.");
       return;
     }
 
@@ -191,6 +208,16 @@ async function main(): Promise<void> {
       console.log(`Installed VS Code Copilot hook at ${hookPath}`);
       console.log(`Hook config: ${hookConfigPath}`);
       console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Copilot file edits.");
+      return;
+    }
+
+    case "install-codex-hook": {
+      await store.init();
+      const hookPath = await installCodexHook(repositoryRoot);
+      const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
+      console.log(`Installed Codex hook at ${hookPath}`);
+      console.log(`Hook config: ${hookConfigPath}`);
+      console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Codex file edits.");
       return;
     }
 
@@ -231,13 +258,15 @@ async function main(): Promise<void> {
     case "hook": {
       await store.init();
       const hookName = args[0];
-      if (hookName !== "copilot-after-edit") {
-        throw new Error("Unknown hook. Supported hook: copilot-after-edit");
+      if (hookName !== "copilot-after-edit" && hookName !== "codex-after-edit") {
+        throw new Error("Unknown hook. Supported hooks: copilot-after-edit, codex-after-edit");
       }
 
       const vscodeHookMode = args.includes("--vscode-hook");
-      const stdInText = vscodeHookMode ? await readStdInText() : "";
+      const codexHookMode = args.includes("--codex-hook");
+      const stdInText = vscodeHookMode || codexHookMode ? await readStdInText() : "";
       let vscodeHookInput: VSCodeHookInput | null = null;
+      let codexHookInput: CodexHookInput | null = null;
       if (vscodeHookMode && stdInText) {
         try {
           vscodeHookInput = JSON.parse(stdInText) as VSCodeHookInput;
@@ -246,37 +275,55 @@ async function main(): Promise<void> {
           return;
         }
       }
+      if (codexHookMode && stdInText) {
+        try {
+          codexHookInput = JSON.parse(stdInText) as CodexHookInput;
+        } catch {
+          return;
+        }
+      }
 
       if (vscodeHookMode && !isCopilotFileEditEvent(vscodeHookInput)) {
         emitVSCodeHookResponse();
         return;
       }
+      if (codexHookMode && !isCodexFileEditEvent(codexHookInput)) {
+        return;
+      }
 
       const config = await loadHookConfig(repositoryRoot);
-      const copilot = config.copilot;
-      if (!copilot?.autoCheckpoint) {
+      const hookConfig = hookName === "copilot-after-edit" ? config.copilot : config.codex;
+      if (!hookConfig?.autoCheckpoint) {
         if (vscodeHookMode) {
           emitVSCodeHookResponse();
           return;
         }
-        console.log("Copilot auto-checkpoint hook is disabled.");
+        if (codexHookMode) {
+          return;
+        }
+        console.log(`${hookName} is disabled.`);
         return;
       }
 
-      const summary = optionValue(args, "--summary") ?? copilot.summary ?? "Copilot file changes";
-      const kind = (optionValue(args, "--kind") ?? copilot.kind ?? "after_edit_batch") as CheckpointKind;
-      const commandValue = optionValue(args, "--command") ?? copilot.command ?? "copilot";
-      const testStatus = (optionValue(args, "--test-status") ?? copilot.testStatus ?? "unknown") as
+      const defaultSummary = hookName === "copilot-after-edit" ? "Copilot file changes" : "Codex file changes";
+      const summary = optionValue(args, "--summary") ?? hookConfig.summary ?? defaultSummary;
+      const kind = (optionValue(args, "--kind") ?? hookConfig.kind ?? "after_edit_batch") as CheckpointKind;
+      const defaultCommand = hookName === "copilot-after-edit" ? "copilot" : "codex";
+      const commandValue = optionValue(args, "--command") ?? hookConfig.command ?? defaultCommand;
+      const testStatus = (optionValue(args, "--test-status") ?? hookConfig.testStatus ?? "unknown") as
         | "unknown"
         | "passed"
         | "failed";
       const hookFiles = vscodeHookMode ? extractHookFilePaths(vscodeHookInput) : [];
-      const statusFiles = await gitStatusFiles(repositoryRoot);
-      const files = [...new Set([...hookFiles, ...statusFiles])];
+      const statusFiles = await gitStatusFiles(repositoryRoot, ignoreRules);
+      const files = [...new Set(filterIgnoredAnvilPaths([...hookFiles, ...statusFiles], ignoreRules))];
 
       if (files.length === 0) {
         if (vscodeHookMode) {
           emitVSCodeHookResponse();
+          return;
+        }
+        if (codexHookMode) {
           return;
         }
         console.log("No workspace changes to checkpoint.");
@@ -293,6 +340,9 @@ async function main(): Promise<void> {
 
       if (vscodeHookMode) {
         emitVSCodeHookResponse(`Anvil recorded checkpoint ${checkpoint.checkpointId} on branch ${checkpoint.gitBranch ?? "unknown"}.`);
+        return;
+      }
+      if (codexHookMode) {
         return;
       }
 
@@ -358,8 +408,12 @@ async function main(): Promise<void> {
       const commandValue = optionValue(args, "--command");
       const prompt = optionValue(args, "--prompt");
       const testStatus = optionValue(args, "--test-status") as "unknown" | "passed" | "failed" | null;
+      const onlyPaths = parsePathList(optionValue(args, "--only"));
       const branch = await resolvedBranchLabel(store);
-      const files = await gitStatusFiles(repositoryRoot);
+      const files =
+        onlyPaths.length > 0
+          ? filterIgnoredAnvilPaths(onlyPaths, ignoreRules)
+          : await gitStatusFiles(repositoryRoot, ignoreRules);
 
       if (files.length === 0) {
         console.log("No Git-detected workspace changes to checkpoint.");
@@ -371,6 +425,7 @@ async function main(): Promise<void> {
       const checkpoint = await store.recordCheckpoint({
         kind: kind as "after_edit_batch",
         summary,
+        snapshotMode: onlyPaths.length > 0 ? "partial" : "full",
         filesChanged: files,
         commandsRun: commandValue ? [commandValue] : [],
         prompt: prompt ?? undefined,

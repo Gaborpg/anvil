@@ -51,6 +51,7 @@ export interface FileSnapshotResponse {
 export interface RecordCheckpointOptions {
   kind: CheckpointKind;
   summary: string;
+  snapshotMode?: "full" | "partial";
   filesChanged?: string[];
   prompt?: string;
   commandsRun?: string[];
