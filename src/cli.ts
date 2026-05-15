@@ -20,13 +20,19 @@ const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+function npmCommand(): string {
+  return process.platform === "win32" ? "npm.cmd" : "npm";
+}
+
 function printHelp(): void {
   console.log(`anvil
 
 Usage:
   anvil init
+  anvil install -g
   anvil install-copilot-hook
   anvil uninstall
+  anvil uninstall -g
   anvil compact --mode keep-last|squash
   anvil hook copilot-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "copilot"] [--test-status passed|failed|unknown] [--vscode-hook]
   anvil review [--port 4312]
@@ -79,6 +85,26 @@ function emitVSCodeHookResponse(additionalContext?: string): void {
   console.log(JSON.stringify(payload));
 }
 
+async function runStreamingCommand(command: string, args: string[], cwd: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      stdio: "inherit",
+      windowsHide: false
+    });
+
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(new Error(`${command} ${args.join(" ")} exited with code ${code ?? "unknown"}`));
+    });
+  });
+}
+
 async function gitStatusFiles(cwd: string): Promise<string[]> {
   const { stdout } = await execFileAsync("git", ["status", "--short", "--untracked-files=all"], {
     cwd,
@@ -129,6 +155,19 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "install": {
+      const globalInstall = args.includes("-g") || args.includes("--global");
+      if (!globalInstall) {
+        throw new Error("install currently supports only -g or --global");
+      }
+
+      await runStreamingCommand(npmCommand(), ["install"], repositoryRoot);
+      await runStreamingCommand(npmCommand(), ["run", "build:all"], repositoryRoot);
+      await runStreamingCommand(npmCommand(), ["link"], repositoryRoot);
+      console.log("Anvil installed globally.");
+      return;
+    }
+
     case "install-copilot-hook": {
       await store.init();
       const hookPath = await installVSCodeCopilotHook(repositoryRoot);
@@ -140,6 +179,17 @@ async function main(): Promise<void> {
     }
 
     case "uninstall": {
+      const globalUninstall = args.includes("-g") || args.includes("--global");
+      if (globalUninstall) {
+        try {
+          await runStreamingCommand(npmCommand(), ["uninstall", "-g", "anvil"], repositoryRoot);
+        } catch {
+          await runStreamingCommand(npmCommand(), ["unlink", "-g", "anvil"], repositoryRoot);
+        }
+        console.log("Removed global Anvil CLI.");
+        return;
+      }
+
       await store.uninstall();
       console.log(`Removed Anvil state from ${repositoryRoot}`);
       return;

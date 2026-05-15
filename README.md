@@ -69,19 +69,45 @@ npm link
 
 After that, `anvil` should work from any Git repository on your machine.
 
+## Short Global Install And Uninstall
+
+If Anvil is already available locally from source, you can use the built-in shortcuts:
+
+```bash
+anvil install -g
+anvil uninstall -g
+```
+
+What they do:
+- `anvil install -g`
+  runs `npm install`, `npm run build:all`, and `npm link`
+- `anvil uninstall -g`
+  removes the global Anvil CLI whether it was installed with `npm install -g` or `npm link`
+
+Important first-time note:
+- if Anvil is not available yet, you still need an initial bootstrap path such as:
+  ```bash
+  npm install
+  npm run dev -- install -g
+  ```
+- after that, future upgrades can use:
+  ```bash
+  anvil install -g
+  ```
+
 Check it:
 
 ```bash
 anvil --help
 ```
 
-If you already installed an older global Anvil CLI and want to remove it first:
+If you want the manual uninstall path instead of the shortcut:
 
 ```bash
 npm uninstall -g anvil
 ```
 
-If you installed it with `npm link`, use:
+If it was installed with `npm link`, the fallback is:
 
 ```bash
 npm unlink -g anvil
