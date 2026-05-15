@@ -138,10 +138,12 @@ anvil init
 - `.anvil/metadata.jsonl`
 - `.anvil/store.git`
 - `.anvil/hooks.yaml`
+- `.anvilignore`
 - `.github/hooks/anvil-copilot.json`
 - `.codex/hooks.json`
 
 The Copilot and Codex hooks are installed, but auto-checkpointing stays disabled until you set `autoCheckpoint: true` in `.anvil/hooks.yaml`.
+If `.gitignore` exists, `anvil init` copies it into `.anvilignore` as a starting point so you can customize Anvil-specific ignores from there.
 
 Or skip that and just use any normal Anvil command. Most commands auto-initialize `.anvil/` on first use.
 

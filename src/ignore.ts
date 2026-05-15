@@ -1,6 +1,6 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 
 const EXACT_IGNORED_PATHS = new Set([
   ".anvilignore",
@@ -25,6 +25,12 @@ export interface AnvilIgnorePattern {
 export interface AnvilIgnoreRules {
   repositoryRoot: string;
   patterns: AnvilIgnorePattern[];
+}
+
+export interface EnsureAnvilIgnoreResult {
+  filePath: string;
+  created: boolean;
+  source: "existing" | "gitignore" | "starter";
 }
 
 function escapeRegex(text: string): string {
@@ -161,6 +167,40 @@ export async function loadAnvilIgnoreRules(repositoryRoot: string): Promise<Anvi
       .split(/\r?\n/)
       .map((line) => parsePattern(line.trim()))
       .filter((rule): rule is AnvilIgnorePattern => Boolean(rule))
+  };
+}
+
+export async function ensureAnvilIgnoreTemplate(repositoryRoot: string): Promise<EnsureAnvilIgnoreResult> {
+  const anvilIgnorePath = path.join(repositoryRoot, ANVIL_IGNORE_FILE);
+  if (existsSync(anvilIgnorePath)) {
+    return {
+      filePath: anvilIgnorePath,
+      created: false,
+      source: "existing"
+    };
+  }
+
+  const gitIgnorePath = path.join(repositoryRoot, ".gitignore");
+  await mkdir(path.dirname(anvilIgnorePath), { recursive: true });
+
+  if (existsSync(gitIgnorePath)) {
+    const gitIgnoreContent = await readFile(gitIgnorePath, "utf8");
+    await writeFile(anvilIgnorePath, gitIgnoreContent, "utf8");
+    return {
+      filePath: anvilIgnorePath,
+      created: true,
+      source: "gitignore"
+    };
+  }
+
+  const starterContent = `# Anvil-specific ignore rules
+# Add files here if you want Anvil to skip them even when Git sees them.
+`;
+  await writeFile(anvilIgnorePath, starterContent, "utf8");
+  return {
+    filePath: anvilIgnorePath,
+    created: true,
+    source: "starter"
   };
 }
 

@@ -24,7 +24,13 @@ import {
   type VSCodeHookInput
 } from "./hooks.js";
 import { getRepositoryRoot } from "./git.js";
-import { collectIgnoredAnvilPaths, filterIgnoredAnvilPaths, loadAnvilIgnoreRules, type AnvilIgnoreRules } from "./ignore.js";
+import {
+  collectIgnoredAnvilPaths,
+  ensureAnvilIgnoreTemplate,
+  filterIgnoredAnvilPaths,
+  loadAnvilIgnoreRules,
+  type AnvilIgnoreRules
+} from "./ignore.js";
 import { CheckpointStore } from "./store.js";
 import type { CheckpointKind } from "./types.js";
 import { formatTimestamp } from "./utils.js";
@@ -297,13 +303,20 @@ async function main(): Promise<void> {
       const hookPath = await installVSCodeCopilotHook(repositoryRoot);
       const codexHookPath = await installCodexHook(repositoryRoot);
       const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
+      const anvilIgnore = await ensureAnvilIgnoreTemplate(repositoryRoot);
       console.log(`Anvil initialized for ${repositoryRoot}`);
       console.log(`State directory: ${path.dirname(config.shadowGitDir)}`);
       console.log(`Shadow store: ${config.shadowGitDir}`);
       console.log(`Metadata: ${config.metadataFile}`);
+      console.log(`Anvil ignore: ${anvilIgnore.filePath}`);
       console.log(`Copilot hook: ${hookPath}`);
       console.log(`Codex hook: ${codexHookPath}`);
       console.log(`Hook config: ${hookConfigPath}`);
+      if (anvilIgnore.source === "gitignore") {
+        console.log("Anvil ignore was created by copying .gitignore.");
+      } else if (anvilIgnore.source === "starter") {
+        console.log("Anvil ignore was created with a starter template because .gitignore was not found.");
+      }
       console.log("Copilot and Codex auto-checkpoint remain disabled until you set autoCheckpoint: true in .anvil/hooks.yaml.");
       return;
     }
