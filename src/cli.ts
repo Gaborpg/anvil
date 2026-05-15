@@ -12,6 +12,7 @@ import {
   loadHookConfig,
   type VSCodeHookInput
 } from "./hooks.js";
+import { getRepositoryRoot } from "./git.js";
 import { CheckpointStore } from "./store.js";
 import type { CheckpointKind } from "./types.js";
 import { formatTimestamp } from "./utils.js";
@@ -131,13 +132,17 @@ async function gitStatusFiles(cwd: string): Promise<string[]> {
 
 async function main(): Promise<void> {
   const [, , command, ...args] = process.argv;
-  const repositoryRoot = process.cwd();
-  const store = new CheckpointStore(repositoryRoot);
+  const launchCwd = process.cwd();
 
   if (!command || command === "--help" || command === "-h") {
     printHelp();
     return;
   }
+
+  const globalInstall = command === "install" && (args.includes("-g") || args.includes("--global"));
+  const globalUninstall = command === "uninstall" && (args.includes("-g") || args.includes("--global"));
+  const repositoryRoot = globalInstall || globalUninstall ? launchCwd : (await getRepositoryRoot(launchCwd)) ?? launchCwd;
+  const store = new CheckpointStore(repositoryRoot);
 
   switch (command) {
     case "init": {
@@ -156,8 +161,7 @@ async function main(): Promise<void> {
     }
 
     case "install": {
-      const globalInstall = args.includes("-g") || args.includes("--global");
-      if (!globalInstall) {
+      if (!(args.includes("-g") || args.includes("--global"))) {
         throw new Error("install currently supports only -g or --global");
       }
 
@@ -179,8 +183,7 @@ async function main(): Promise<void> {
     }
 
     case "uninstall": {
-      const globalUninstall = args.includes("-g") || args.includes("--global");
-      if (globalUninstall) {
+      if (args.includes("-g") || args.includes("--global")) {
         try {
           await runStreamingCommand(npmCommand(), ["uninstall", "-g", "anvil"], repositoryRoot);
         } catch {

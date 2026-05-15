@@ -36,6 +36,15 @@ export async function getCurrentBranch(cwd: string): Promise<string | null> {
   }
 }
 
+export async function getRepositoryRoot(cwd: string): Promise<string | null> {
+  try {
+    const root = await runGit(["rev-parse", "--show-toplevel"], cwd);
+    return root.length > 0 ? root : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function getHeadReflogMessages(cwd: string, limit = 20): Promise<string[]> {
   try {
     const output = await runGit(["reflog", "--format=%gs", `-n`, String(limit)], cwd);
