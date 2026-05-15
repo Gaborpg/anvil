@@ -130,6 +130,18 @@ async function gitStatusFiles(cwd: string): Promise<string[]> {
     );
 }
 
+async function resolvedBranchLabel(store: CheckpointStore): Promise<string> {
+  return (await store.currentBranch()) ?? "unknown";
+}
+
+function printRepositoryContext(repositoryRoot: string, launchCwd: string, branch: string): void {
+  console.log(`Repo root: ${repositoryRoot}`);
+  if (repositoryRoot !== launchCwd) {
+    console.log(`Launched from: ${launchCwd}`);
+  }
+  console.log(`Branch: ${branch}`);
+}
+
 async function main(): Promise<void> {
   const [, , command, ...args] = process.argv;
   const launchCwd = process.cwd();
@@ -346,10 +358,13 @@ async function main(): Promise<void> {
       const commandValue = optionValue(args, "--command");
       const prompt = optionValue(args, "--prompt");
       const testStatus = optionValue(args, "--test-status") as "unknown" | "passed" | "failed" | null;
+      const branch = await resolvedBranchLabel(store);
       const files = await gitStatusFiles(repositoryRoot);
 
       if (files.length === 0) {
-        console.log("No workspace changes to checkpoint.");
+        console.log("No Git-detected workspace changes to checkpoint.");
+        printRepositoryContext(repositoryRoot, launchCwd, branch);
+        console.log('Hint: run `git status --short` here to confirm which files Git sees.');
         return;
       }
 
@@ -363,7 +378,7 @@ async function main(): Promise<void> {
       });
 
       console.log(`Recorded ${checkpoint.checkpointId}`);
-      console.log(`Branch: ${checkpoint.gitBranch ?? "unknown"}`);
+      printRepositoryContext(repositoryRoot, launchCwd, checkpoint.gitBranch ?? branch);
       console.log(`Shadow ref: ${checkpoint.shadowRef ?? "unknown"}`);
       console.log(`Files: ${checkpoint.filesChanged.join(", ")}`);
       if (checkpoint.bootstrappedFromBranch) {
