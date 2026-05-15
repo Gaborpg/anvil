@@ -272,6 +272,8 @@ Example:
 coverage/
 dist/
 my-local-note.txt
+src/generated/**
+!src/generated/keep.ts
 ```
 
 This affects:
@@ -280,6 +282,17 @@ This affects:
 - full snapshot staging
 
 It does not change your normal Git ignore rules.
+
+`.anvilignore` now supports:
+- `*`, `**`, and `?` globs
+- basename rules like `*.tmp`
+- path rules like `src/generated/**`
+- directory rules like `coverage/`
+- negation rules like `!src/generated/keep.ts`
+
+Important:
+- rules are evaluated in order, so later rules can override earlier ones
+- Anvil's own built-in internal files are still always ignored
 
 ## Copilot Auto-Checkpoint Hook
 
@@ -414,6 +427,7 @@ This reports:
 - whether `.codex/hooks.json` exists
 - whether `.anvilignore` exists
 - the last recorded hook execution, including whether it was ignored, disabled, had no changes, or created a checkpoint
+- which currently dirty Git paths are being ignored by Anvil
 
 This is the fastest way to debug “why didn’t the hook run?” before chasing editor-specific behavior.
 

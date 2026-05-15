@@ -22,7 +22,7 @@ import {
   type VSCodeHookInput
 } from "./hooks.js";
 import { getRepositoryRoot } from "./git.js";
-import { filterIgnoredAnvilPaths, loadAnvilIgnoreRules, type AnvilIgnoreRules } from "./ignore.js";
+import { collectIgnoredAnvilPaths, filterIgnoredAnvilPaths, loadAnvilIgnoreRules, type AnvilIgnoreRules } from "./ignore.js";
 import { CheckpointStore } from "./store.js";
 import type { CheckpointKind } from "./types.js";
 import { formatTimestamp } from "./utils.js";
@@ -152,6 +152,38 @@ async function gitStatusFiles(cwd: string, ignoreRules?: AnvilIgnoreRules): Prom
   );
 }
 
+async function gitStatusSnapshot(
+  cwd: string,
+  ignoreRules?: AnvilIgnoreRules
+): Promise<{ visible: string[]; ignored: string[] }> {
+  const { stdout } = await execFileAsync("git", ["status", "--short", "--untracked-files=all"], {
+    cwd,
+    windowsHide: true
+  });
+
+  const paths = stdout
+    .replace(/\r?\n$/, "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .map((line) => {
+      const filePart = line.length >= 4 ? line.slice(3).trim() : line.trim();
+      const renameParts = filePart.split(" -> ");
+      return renameParts.at(-1)?.trim() ?? filePart.trim();
+    });
+
+  return {
+    visible: filterIgnoredAnvilPaths(paths, ignoreRules),
+    ignored: collectIgnoredAnvilPaths(paths, ignoreRules).filter(
+      (filePath) =>
+        !filePath.startsWith(".anvil/") &&
+        filePath !== ".anvilignore" &&
+        filePath !== ".github/hooks/anvil-copilot.json" &&
+        filePath !== ".codex/hooks.json"
+    )
+  };
+}
+
 async function resolvedBranchLabel(store: CheckpointStore): Promise<string> {
   return (await store.currentBranch()) ?? "unknown";
 }
@@ -181,6 +213,7 @@ async function printHookStatus(
   const codexHookFile = codexHookConfigPath(repositoryRoot);
   const anvilIgnoreFile = path.join(repositoryRoot, ".anvilignore");
   const ignorePatternCount = ignoreRules?.patterns.length ?? 0;
+  const gitStatus = await gitStatusSnapshot(repositoryRoot, ignoreRules);
 
   const copilotReady = existsSync(copilotHookFile) && Boolean(config.copilot?.autoCheckpoint);
   const codexReady = existsSync(codexHookFile) && Boolean(config.codex?.autoCheckpoint);
@@ -201,6 +234,13 @@ async function printHookStatus(
   console.log("Ignore rules");
   console.log(`  ${formatStatusLine(".anvilignore", existsSync(anvilIgnoreFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine("active custom ignore patterns", String(ignorePatternCount))}`);
+  if (ignoreRules?.patterns.length) {
+    console.log(`  ${formatStatusLine("patterns", ignoreRules.patterns.map((rule) => rule.raw).join(", "))}`);
+  }
+  console.log(`  ${formatStatusLine("currently ignored dirty paths", String(gitStatus.ignored.length))}`);
+  if (gitStatus.ignored.length) {
+    console.log(`  ${formatStatusLine("ignored paths", gitStatus.ignored.join(", "))}`);
+  }
   console.log("");
   console.log("Ready state");
   console.log(`  ${formatStatusLine("Copilot hook ready", copilotReady ? "yes" : "no")}`);
@@ -333,12 +373,12 @@ async function main(): Promise<void> {
     }
 
     case "hook": {
-      await store.init();
       const hookName = args[0];
       if (hookName === "status" || hookName === "doctor") {
         await printHookStatus(repositoryRoot, launchCwd, store, ignoreRules);
         return;
       }
+      await store.init();
       if (hookName !== "copilot-after-edit" && hookName !== "codex-after-edit") {
         throw new Error("Unknown hook. Supported hooks: status, doctor, copilot-after-edit, codex-after-edit");
       }
