@@ -29,6 +29,7 @@ export interface VSCodeHookInput {
 const HOOKS_FILE_NAME = "hooks.yaml";
 const VSCODE_HOOKS_DIR = path.join(".github", "hooks");
 const VSCODE_COPILOT_HOOK_FILE_NAME = "anvil-copilot.json";
+const ANVIL_INTERNAL_HOOK_PATH = `${VSCODE_HOOKS_DIR.replace(/\\/g, "/")}/${VSCODE_COPILOT_HOOK_FILE_NAME}`;
 const FILE_EDIT_TOOL_NAMES = new Set([
   "editFiles",
   "createFile",
@@ -183,6 +184,49 @@ export function isCopilotFileEditEvent(input: VSCodeHookInput | null): boolean {
   }
 
   return Array.isArray(toolInput.files) || Boolean(toolInput.filePath || toolInput.oldFilePath || toolInput.newFilePath);
+}
+
+function normalizeHookFilePath(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim().replace(/\\/g, "/");
+  if (!trimmed || trimmed.startsWith(".anvil/") || trimmed === ANVIL_INTERNAL_HOOK_PATH) {
+    return null;
+  }
+
+  return trimmed;
+}
+
+export function extractHookFilePaths(input: VSCodeHookInput | null): string[] {
+  if (!input?.tool_input) {
+    return [];
+  }
+
+  const toolInput = input.tool_input;
+  const paths = new Set<string>();
+
+  const directPaths = [
+    normalizeHookFilePath(toolInput.filePath),
+    normalizeHookFilePath(toolInput.oldFilePath),
+    normalizeHookFilePath(toolInput.newFilePath)
+  ].filter((value): value is string => Boolean(value));
+
+  for (const filePath of directPaths) {
+    paths.add(filePath);
+  }
+
+  if (Array.isArray(toolInput.files)) {
+    for (const item of toolInput.files) {
+      const filePath = normalizeHookFilePath(item);
+      if (filePath) {
+        paths.add(filePath);
+      }
+    }
+  }
+
+  return [...paths];
 }
 
 export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<string> {

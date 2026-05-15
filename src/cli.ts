@@ -6,6 +6,7 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
   ensureHookConfigTemplate,
+  extractHookFilePaths,
   installVSCodeCopilotHook,
   isCopilotFileEditEvent,
   loadHookConfig,
@@ -94,7 +95,12 @@ async function gitStatusFiles(cwd: string): Promise<string[]> {
       const renameParts = filePart.split(" -> ");
       return renameParts.at(-1)?.trim() ?? filePart.trim();
     })
-    .filter((file) => file.length > 0 && !file.startsWith(".anvil"));
+    .filter(
+      (file) =>
+        file.length > 0 &&
+        !file.startsWith(".anvil") &&
+        file !== ".github/hooks/anvil-copilot.json"
+    );
 }
 
 async function main(): Promise<void> {
@@ -199,7 +205,9 @@ async function main(): Promise<void> {
         | "unknown"
         | "passed"
         | "failed";
-      const files = await gitStatusFiles(repositoryRoot);
+      const hookFiles = vscodeHookMode ? extractHookFilePaths(vscodeHookInput) : [];
+      const statusFiles = await gitStatusFiles(repositoryRoot);
+      const files = [...new Set([...hookFiles, ...statusFiles])];
 
       if (files.length === 0) {
         if (vscodeHookMode) {
