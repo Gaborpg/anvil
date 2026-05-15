@@ -10,6 +10,8 @@ import {
   type CodexHookInput,
   codexHookConfigPath,
   ensureHookConfigTemplate,
+  extractCodexHookFilePaths,
+  extractCodexHookFilePathsFromText,
   extractHookFilePaths,
   hookConfigPath,
   installCodexHook,
@@ -472,9 +474,22 @@ async function main(): Promise<void> {
         | "unknown"
         | "passed"
         | "failed";
-      const hookFiles = vscodeHookMode ? extractHookFilePaths(vscodeHookInput) : [];
+      const hookFiles = vscodeHookMode
+        ? extractHookFilePaths(vscodeHookInput)
+        : codexHookMode
+          ? (() => {
+              const extracted = extractCodexHookFilePaths(codexHookInput);
+              return extracted.length > 0 ? extracted : extractCodexHookFilePathsFromText(stdInText);
+            })()
+          : [];
       const statusFiles = await gitStatusFiles(repositoryRoot, ignoreRules);
-      const files = [...new Set(filterIgnoredAnvilPaths([...hookFiles, ...statusFiles], ignoreRules))];
+      const files = vscodeHookMode
+        ? [...new Set(filterIgnoredAnvilPaths([...hookFiles, ...statusFiles], ignoreRules))]
+        : codexHookMode
+          ? hookFiles.length > 0
+            ? [...new Set(filterIgnoredAnvilPaths(hookFiles, ignoreRules))]
+            : statusFiles
+          : [...new Set(filterIgnoredAnvilPaths([...hookFiles, ...statusFiles], ignoreRules))];
 
       if (files.length === 0) {
         await appendHookExecutionLog(repositoryRoot, {
@@ -499,6 +514,7 @@ async function main(): Promise<void> {
       const checkpoint = await store.recordCheckpoint({
         kind,
         summary,
+        snapshotMode: hookFiles.length > 0 ? "partial" : "full",
         filesChanged: files,
         commandsRun: commandValue ? [commandValue] : [],
         testStatus

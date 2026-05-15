@@ -302,6 +302,43 @@ export function extractHookFilePaths(input: VSCodeHookInput | null): string[] {
   return [...paths];
 }
 
+export function extractCodexHookFilePaths(input: CodexHookInput | null): string[] {
+  const command = input?.tool_input?.command;
+  return typeof command === "string" ? extractCodexHookFilePathsFromText(command) : [];
+}
+
+export function extractCodexHookFilePathsFromText(command: string): string[] {
+  const normalizedCommand = command
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/`r`n/g, "\n")
+    .replace(/`n/g, "\n");
+
+  if (!normalizedCommand.trim()) {
+    return [];
+  }
+
+  const paths = new Set<string>();
+  const patterns = [
+    /^\*\*\* Update File:\s+(.+)$/gm,
+    /^\*\*\* Add File:\s+(.+)$/gm,
+    /^\*\*\* Delete File:\s+(.+)$/gm,
+    /^\+\+\+\s+b\/(.+)$/gm,
+    /^---\s+a\/(.+)$/gm
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of normalizedCommand.matchAll(pattern)) {
+      const filePath = normalizeHookFilePath(match[1]);
+      if (filePath) {
+        paths.add(filePath);
+      }
+    }
+  }
+
+  return [...paths];
+}
+
 export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<string> {
   const hookPath = vscodeCopilotHookConfigPath(repositoryRoot);
   await mkdir(path.dirname(hookPath), { recursive: true });
