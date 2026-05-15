@@ -75,6 +75,24 @@ Check it:
 anvil --help
 ```
 
+If you already installed an older global Anvil CLI and want to remove it first:
+
+```bash
+npm uninstall -g anvil
+```
+
+If you installed it with `npm link`, use:
+
+```bash
+npm unlink -g anvil
+```
+
+To see where `anvil` is currently coming from on Windows:
+
+```bash
+where anvil
+```
+
 ## Use Anvil In Another Repo
 
 Go to any normal Git repo:
