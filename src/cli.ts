@@ -217,6 +217,23 @@ function emitVSCodeGuardDecision(
   );
 }
 
+function emitCodexGuardDecision(
+  decision: "allow" | "ask" | "deny",
+  reason: string,
+  additionalContext?: string
+): void {
+  console.log(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: decision,
+        permissionDecisionReason: reason,
+        ...(additionalContext ? { additionalContext } : {})
+      }
+    })
+  );
+}
+
 async function runStreamingCommand(command: string, args: string[], cwd: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
@@ -634,16 +651,7 @@ async function main(): Promise<void> {
             mode: hookMode,
             message: "Could not parse Codex PreToolUse payload."
           });
-          console.log(
-            JSON.stringify({
-              continue: true,
-              hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "deny",
-                permissionDecisionReason: "Anvil execution guard could not parse the tool payload."
-              }
-            })
-          );
+          emitCodexGuardDecision("deny", "Anvil execution guard could not parse the tool payload.");
           return;
         }
       }
@@ -691,17 +699,7 @@ async function main(): Promise<void> {
       }
 
       if (codexHookMode) {
-        console.log(
-          JSON.stringify({
-            continue: true,
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
-              permissionDecision: externalDecision,
-              permissionDecisionReason: explanation,
-              additionalContext
-            }
-          })
-        );
+        emitCodexGuardDecision(externalDecision, explanation, additionalContext);
         return;
       }
 
