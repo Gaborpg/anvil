@@ -3,14 +3,19 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { getCurrentBranch, getHeadReflogMessages, getOriginUrl, runGit, runGitRaw } from "./git.js";
 import { filterIgnoredAnvilPaths, isIgnoredAnvilPath, loadAnvilIgnoreRules, type AnvilIgnoreRules } from "./ignore.js";
-import type { CheckpointMetadata, FileSnapshotResponse, RecordCheckpointOptions, StoreConfig, TimelineResponse } from "./types.js";
+import type { BranchListResponse, BranchSummary, CheckpointMetadata, FileSnapshotResponse, PruneOptions, PruneResult, RecordCheckpointOptions, StoreConfig, TimelineResponse } from "./types.js";
 import { checkpointNumber, ensureDir, hashText, readJson, writeJson } from "./utils.js";
 
 const STORE_DIR_NAME = ".anvil";
 const SHADOW_DIR_NAME = "store.git";
 const METADATA_FILE_NAME = "metadata.jsonl";
 const CONFIG_FILE_NAME = "config.json";
+const HOOK_EXECUTION_LOG_FILE_NAME = "hook-executions.jsonl";
 const SHADOW_EXCLUDE_LINES = [".anvil/", ".anvil/**"];
+const DEFAULT_RETENTION = {
+  maxCheckpointsPerBranch: 50,
+  maxHookLogs: 500
+} as const;
 
 interface ShadowBranchContext {
   branch: string;
@@ -50,6 +55,10 @@ export class CheckpointStore {
     return path.join(this.baseDir, CONFIG_FILE_NAME);
   }
 
+  get hookExecutionLogFile(): string {
+    return path.join(this.baseDir, HOOK_EXECUTION_LOG_FILE_NAME);
+  }
+
   private async ignoreRules(): Promise<AnvilIgnoreRules> {
     if (!this.ignoreRulesPromise) {
       this.ignoreRulesPromise = loadAnvilIgnoreRules(this.repositoryRoot);
@@ -76,7 +85,10 @@ export class CheckpointStore {
       version: 1,
       repositoryRoot: this.repositoryRoot,
       shadowGitDir: this.shadowGitDir,
-      metadataFile: this.metadataFile
+      metadataFile: this.metadataFile,
+      retention: {
+        ...DEFAULT_RETENTION
+      }
     };
 
     if (!existsSync(this.configFile)) {
@@ -278,12 +290,35 @@ export class CheckpointStore {
   }
 
   async loadConfig(): Promise<StoreConfig> {
-    const config = await readJson<StoreConfig>(this.configFile);
+    const config = await readJson<Partial<StoreConfig>>(this.configFile);
     if (!config) {
       return this.init();
     }
 
-    return config;
+    const normalized: StoreConfig = {
+      version: 1,
+      repositoryRoot: config.repositoryRoot ?? this.repositoryRoot,
+      shadowGitDir: config.shadowGitDir ?? this.shadowGitDir,
+      metadataFile: config.metadataFile ?? this.metadataFile,
+      retention: {
+        maxCheckpointsPerBranch: config.retention?.maxCheckpointsPerBranch ?? DEFAULT_RETENTION.maxCheckpointsPerBranch,
+        maxHookLogs: config.retention?.maxHookLogs ?? DEFAULT_RETENTION.maxHookLogs
+      }
+    };
+
+    const shouldRewrite =
+      config.version !== normalized.version ||
+      config.repositoryRoot !== normalized.repositoryRoot ||
+      config.shadowGitDir !== normalized.shadowGitDir ||
+      config.metadataFile !== normalized.metadataFile ||
+      config.retention?.maxCheckpointsPerBranch !== normalized.retention.maxCheckpointsPerBranch ||
+      config.retention?.maxHookLogs !== normalized.retention.maxHookLogs;
+
+    if (shouldRewrite) {
+      await writeJson(this.configFile, normalized);
+    }
+
+    return normalized;
   }
 
   async readMetadata(): Promise<CheckpointMetadata[]> {
@@ -354,6 +389,53 @@ export class CheckpointStore {
     return checkpoints.find((entry) => entry.checkpointId === checkpointId) ?? null;
   }
 
+  async listBranches(): Promise<BranchListResponse> {
+    const checkpoints = await this.readMetadata();
+    const currentBranch = await this.currentBranch();
+    const map = new Map<string, BranchSummary>();
+
+    for (const checkpoint of checkpoints) {
+      if (!checkpoint.gitBranch) {
+        continue;
+      }
+
+      const current = map.get(checkpoint.gitBranch);
+      if (!current) {
+        map.set(checkpoint.gitBranch, {
+          branch: checkpoint.gitBranch,
+          shadowRef: checkpoint.shadowRef,
+          checkpointCount: 1,
+          latestCheckpointId: checkpoint.checkpointId,
+          latestTimestamp: checkpoint.timestamp
+        });
+        continue;
+      }
+
+      current.checkpointCount += 1;
+      current.latestCheckpointId = checkpoint.checkpointId;
+      current.latestTimestamp = checkpoint.timestamp;
+      current.shadowRef = checkpoint.shadowRef ?? current.shadowRef;
+    }
+
+    const branches = [...map.values()].sort((left, right) => {
+      if (left.branch === currentBranch) {
+        return -1;
+      }
+      if (right.branch === currentBranch) {
+        return 1;
+      }
+
+      return (right.latestTimestamp ?? "").localeCompare(left.latestTimestamp ?? "");
+    });
+
+    return {
+      repositoryName: path.basename(this.repositoryRoot),
+      repositoryRoot: this.repositoryRoot,
+      currentBranch,
+      branches
+    };
+  }
+
   private shadowRefForBranch(branch: string): string {
     return `refs/anvil/${branch}`;
   }
@@ -382,6 +464,14 @@ export class CheckpointStore {
 
   private async updateShadowRef(shadowRef: string, commitSha: string): Promise<void> {
     await runGit(["update-ref", shadowRef, commitSha], this.repositoryRoot, this.shadowGitDir);
+  }
+
+  private async deleteShadowRef(shadowRef: string): Promise<void> {
+    try {
+      await runGit(["update-ref", "-d", shadowRef], this.repositoryRoot, this.shadowGitDir);
+    } catch {
+      // Ignore missing refs.
+    }
   }
 
   private async commitTree(treeSha: string, message: string): Promise<string> {
@@ -808,5 +898,213 @@ export class CheckpointStore {
     }
 
     return retainedEntry;
+  }
+
+  private async treeShaForCommit(commitSha: string): Promise<string> {
+    return runGit(["rev-parse", `${commitSha}^{tree}`], this.repositoryRoot, this.shadowGitDir);
+  }
+
+  private async rebuildRetainedBranchHistory(
+    branch: string,
+    branchCheckpoints: CheckpointMetadata[],
+    maxCheckpointsPerBranch: number
+  ): Promise<CheckpointMetadata[]> {
+    if (branchCheckpoints.length <= maxCheckpointsPerBranch) {
+      return branchCheckpoints;
+    }
+
+    const retained = branchCheckpoints.slice(-maxCheckpointsPerBranch);
+    const shadowRef = retained.at(-1)?.shadowRef ?? this.shadowRefForBranch(branch);
+    let parentSha: string | null = null;
+    const rebuilt: CheckpointMetadata[] = [];
+
+    for (let index = 0; index < retained.length; index += 1) {
+      const checkpoint = retained[index];
+      const treeSha = await this.treeShaForCommit(checkpoint.shadowCommitSha);
+      const commitArgs = [
+        "-c",
+        "user.name=anvil",
+        "-c",
+        "user.email=anvil@local",
+        "commit-tree",
+        treeSha
+      ];
+      if (parentSha) {
+        commitArgs.push("-p", parentSha);
+      }
+      commitArgs.push("-m", `${checkpoint.checkpointId} ${checkpoint.kind}: ${checkpoint.summary}`);
+      const rebuiltSha = await runGit(commitArgs, this.repositoryRoot, this.shadowGitDir);
+
+      const rebuiltCheckpoint: CheckpointMetadata = {
+        ...checkpoint,
+        parentCheckpointId: rebuilt.at(-1)?.checkpointId ?? null,
+        shadowCommitSha: rebuiltSha,
+        shadowRef,
+        bootstrappedFromBranch: index === 0 ? checkpoint.bootstrappedFromBranch : null,
+        bootstrappedFromCheckpointId: index === 0 ? checkpoint.bootstrappedFromCheckpointId : null,
+        bootstrappedAt: index === 0 ? checkpoint.bootstrappedAt : null
+      };
+
+      rebuilt.push(rebuiltCheckpoint);
+      parentSha = rebuiltSha;
+    }
+
+    if (parentSha) {
+      await this.updateShadowRef(shadowRef, parentSha);
+      await this.pointShadowHeadAt(shadowRef);
+    }
+
+    return rebuilt;
+  }
+
+  private async pruneHookExecutionLog(maxHookLogs: number, dryRun: boolean): Promise<number> {
+    if (!existsSync(this.hookExecutionLogFile)) {
+      return 0;
+    }
+
+    const raw = await readFile(this.hookExecutionLogFile, "utf8");
+    const lines = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (lines.length <= maxHookLogs) {
+      return 0;
+    }
+
+    const retained = lines.slice(-maxHookLogs);
+    const removed = lines.length - retained.length;
+
+    if (!dryRun) {
+      await writeFile(this.hookExecutionLogFile, retained.length > 0 ? `${retained.join("\n")}\n` : "", "utf8");
+    }
+
+    return removed;
+  }
+
+  async prune(options: PruneOptions = {}): Promise<PruneResult> {
+    const config = await this.loadConfig();
+    const dryRun = Boolean(options.dryRun);
+    const maxCheckpointsPerBranch = options.maxCheckpointsPerBranch ?? config.retention.maxCheckpointsPerBranch;
+    const maxHookLogs = options.maxHookLogs ?? config.retention.maxHookLogs;
+
+    if (!Number.isInteger(maxCheckpointsPerBranch) || maxCheckpointsPerBranch < 1) {
+      throw new Error("maxCheckpointsPerBranch must be an integer >= 1.");
+    }
+    if (!Number.isInteger(maxHookLogs) || maxHookLogs < 1) {
+      throw new Error("maxHookLogs must be an integer >= 1.");
+    }
+
+    const checkpoints = await this.readMetadata();
+    const grouped = new Map<string, CheckpointMetadata[]>();
+    for (const checkpoint of checkpoints) {
+      const branch = checkpoint.gitBranch ?? "__unknown__";
+      const list = grouped.get(branch) ?? [];
+      list.push(checkpoint);
+      grouped.set(branch, list);
+    }
+
+    let checkpointsRemoved = 0;
+    const affectedBranches: string[] = [];
+    const rebuiltById = new Map<string, CheckpointMetadata>();
+    for (const [branch, branchCheckpoints] of grouped) {
+      if (branch === "__unknown__") {
+        continue;
+      }
+
+      if (branchCheckpoints.length > maxCheckpointsPerBranch) {
+        checkpointsRemoved += branchCheckpoints.length - maxCheckpointsPerBranch;
+        affectedBranches.push(branch);
+      }
+
+      const retained = dryRun
+        ? branchCheckpoints.slice(-maxCheckpointsPerBranch)
+        : await this.rebuildRetainedBranchHistory(branch, branchCheckpoints, maxCheckpointsPerBranch);
+
+      for (const checkpoint of retained) {
+        rebuiltById.set(checkpoint.checkpointId, checkpoint);
+      }
+    }
+
+    const nextMetadata = checkpoints
+      .map((checkpoint) => {
+        if (!checkpoint.gitBranch) {
+          return checkpoint;
+        }
+        return rebuiltById.get(checkpoint.checkpointId) ?? null;
+      })
+      .filter((checkpoint): checkpoint is CheckpointMetadata => checkpoint !== null);
+
+    if (!dryRun && checkpointsRemoved > 0) {
+      const serialized = nextMetadata.map((entry) => JSON.stringify(entry)).join("\n");
+      await writeFile(this.metadataFile, serialized.length > 0 ? `${serialized}\n` : "", "utf8");
+    }
+
+    const hookLogsRemoved = await this.pruneHookExecutionLog(maxHookLogs, dryRun);
+
+    if (!dryRun) {
+      const updatedConfig: StoreConfig = {
+        ...config,
+        retention: {
+          maxCheckpointsPerBranch,
+          maxHookLogs
+        }
+      };
+      await writeJson(this.configFile, updatedConfig);
+
+      try {
+        await runGit(["reflog", "expire", "--expire=now", "--all"], this.repositoryRoot, this.shadowGitDir);
+        await runGit(["gc", "--prune=now"], this.repositoryRoot, this.shadowGitDir);
+      } catch {
+        // Best-effort cleanup only.
+      }
+    }
+
+    return {
+      dryRun,
+      maxCheckpointsPerBranch,
+      maxHookLogs,
+      checkpointsRemoved,
+      hookLogsRemoved,
+      affectedBranches
+    };
+  }
+
+  async deleteBranches(branchesToDelete: string[]): Promise<BranchListResponse> {
+    await this.loadConfig();
+    const uniqueBranches = [...new Set(branchesToDelete.map((branch) => branch.trim()).filter(Boolean))];
+    if (uniqueBranches.length === 0) {
+      return this.listBranches();
+    }
+
+    const checkpoints = await this.readMetadata();
+    const deletedSet = new Set(uniqueBranches);
+    const retained = checkpoints.filter((checkpoint) => !checkpoint.gitBranch || !deletedSet.has(checkpoint.gitBranch));
+
+    for (const branch of uniqueBranches) {
+      await this.deleteShadowRef(this.shadowRefForBranch(branch));
+    }
+
+    const serialized = retained.map((entry) => JSON.stringify(entry)).join("\n");
+    await writeFile(this.metadataFile, serialized.length > 0 ? `${serialized}\n` : "", "utf8");
+
+    try {
+      await runGit(["reflog", "expire", "--expire=now", "--all"], this.repositoryRoot, this.shadowGitDir);
+      await runGit(["gc", "--prune=now"], this.repositoryRoot, this.shadowGitDir);
+    } catch {
+      // Best-effort cleanup only.
+    }
+
+    return this.listBranches();
+  }
+
+  async keepOnlyBranches(branchesToKeep: string[]): Promise<BranchListResponse> {
+    const inventory = await this.listBranches();
+    const keepSet = new Set(branchesToKeep.map((branch) => branch.trim()).filter(Boolean));
+    const branchesToDelete = inventory.branches
+      .map((branch) => branch.branch)
+      .filter((branch) => !keepSet.has(branch));
+
+    return this.deleteBranches(branchesToDelete);
   }
 }

@@ -37,6 +37,7 @@ Inside any repo that uses Anvil:
 - `store.git` is the hidden shadow Git repository
 - `metadata.jsonl` is the append-only checkpoint log
 - `hooks.yaml` is the optional repo-local hook config
+- `config.json` also stores retention settings for prune
 - checkpoints are branch-aware
 - each Git branch maps to an internal shadow ref like `refs/anvil/main`
 
@@ -140,6 +141,7 @@ anvil init
 - `.anvil/hooks.yaml`
 - `.anvilignore`
 - `.github/hooks/anvil-copilot.json`
+- `.codex/anvil-codex-after-edit.mjs`
 - `.codex/hooks.json`
 
 The Copilot and Codex hooks are installed, but auto-checkpointing stays disabled until you set `autoCheckpoint: true` in `.anvil/hooks.yaml`.
@@ -185,6 +187,7 @@ anvil explain <checkpoint>
 anvil assign-branch <checkpoint> [branch]
 anvil export [--preview] [--message "message"]
 anvil compact --mode keep-last|squash
+anvil prune [--dry-run] [--max-checkpoints-per-branch 50] [--max-hook-logs 500]
 anvil uninstall
 ```
 
@@ -382,11 +385,26 @@ That creates:
 .codex/hooks.json
 ```
 
-The installed hook listens for Codex `PostToolUse` on `apply_patch` edits and calls:
+and a repo-local wrapper:
+
+```text
+.codex/anvil-codex-after-edit.mjs
+```
+
+The installed hook listens for Codex `PostToolUse` on `apply_patch` edits and calls the wrapper:
 
 ```bash
-anvil hook codex-after-edit --codex-hook
+node .codex/anvil-codex-after-edit.mjs
 ```
+
+What the wrapper is for:
+- Codex hook payloads can describe edited files in different shapes
+- the wrapper normalizes those payloads into a small file-scoped patch summary
+- then it forwards that normalized payload into:
+  ```bash
+  anvil hook codex-after-edit --codex-hook
+  ```
+- that keeps Codex hook checkpoints focused on the files Codex actually edited instead of every dirty file in the repo
 
 To enable it, turn on the repo-local Anvil hook config:
 
@@ -524,6 +542,49 @@ anvil compact --mode squash
 ```
 
 These affect only `.anvil/`, not your real Git commit history.
+
+## Prune And Retention
+
+Anvil now keeps retention settings in:
+
+```text
+.anvil/config.json
+```
+
+Default config created by `anvil init` includes:
+
+```json
+{
+  "retention": {
+    "maxCheckpointsPerBranch": 50,
+    "maxHookLogs": 500
+  }
+}
+```
+
+Run prune using the config values:
+
+```bash
+anvil prune
+```
+
+Preview what prune would do without changing anything:
+
+```bash
+anvil prune --dry-run
+```
+
+Override the config for a run:
+
+```bash
+anvil prune --max-checkpoints-per-branch 25 --max-hook-logs 200
+```
+
+What prune does:
+- keeps only the newest configured number of checkpoints per branch
+- trims old hook execution log entries
+- updates `.anvil/config.json` when you provide override values
+- runs shadow Git garbage collection after rewriting retained history
 
 ## Remove Anvil From A Repo
 

@@ -1,4 +1,4 @@
-import type { DiffResponse, ExplainItem, ExportPreviewResponse, FileSnapshotResponse, TimelineResponse } from "./types";
+import type { BranchListResponse, DiffResponse, ExplainItem, ExportPreviewResponse, FileSnapshotResponse, TimelineResponse } from "./types";
 
 function withRepo(pathname: string, repo?: string): string {
   if (!repo) {
@@ -21,6 +21,10 @@ async function readJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
 
 export function fetchTimeline(repo?: string): Promise<TimelineResponse> {
   return readJson<TimelineResponse>(withRepo("/api/timeline", repo));
+}
+
+export function fetchBranches(repo?: string): Promise<BranchListResponse> {
+  return readJson<BranchListResponse>(withRepo("/api/branches", repo));
 }
 
 export function fetchCheckpoint(checkpointId: string, repo?: string): Promise<ExplainItem> {
@@ -65,5 +69,25 @@ export function restoreCheckpoint(checkpointId: string, repo?: string): Promise<
       "Content-Type": "application/json"
     },
     body: JSON.stringify({ checkpointId, repo })
+  });
+}
+
+export function deleteBranches(branches: string[], repo?: string): Promise<BranchListResponse> {
+  return readJson<BranchListResponse>("/api/branches/delete", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ branches, repo })
+  });
+}
+
+export function keepBranches(branches: string[], repo?: string): Promise<BranchListResponse> {
+  return readJson<BranchListResponse>("/api/branches/keep", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ branches, repo })
   });
 }

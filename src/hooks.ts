@@ -32,6 +32,17 @@ export interface CodexHookInput {
   tool_name?: string;
   tool_input?: {
     command?: unknown;
+    filePath?: unknown;
+    file_path?: unknown;
+    path?: unknown;
+    oldFilePath?: unknown;
+    newFilePath?: unknown;
+    old_file_path?: unknown;
+    new_file_path?: unknown;
+    files?: unknown;
+    edits?: unknown;
+    writes?: unknown;
+    changes?: unknown;
   };
 }
 
@@ -52,8 +63,10 @@ const VSCODE_HOOKS_DIR = path.join(".github", "hooks");
 const VSCODE_COPILOT_HOOK_FILE_NAME = "anvil-copilot.json";
 const CODEX_HOOKS_DIR = path.join(".codex");
 const CODEX_HOOKS_FILE_NAME = "hooks.json";
+const CODEX_WRAPPER_FILE_NAME = "anvil-codex-after-edit.mjs";
 const ANVIL_INTERNAL_HOOK_PATH = `${VSCODE_HOOKS_DIR.replace(/\\/g, "/")}/${VSCODE_COPILOT_HOOK_FILE_NAME}`;
 const ANVIL_INTERNAL_CODEX_HOOK_PATH = `${CODEX_HOOKS_DIR.replace(/\\/g, "/")}/${CODEX_HOOKS_FILE_NAME}`;
+const ANVIL_INTERNAL_CODEX_WRAPPER_PATH = `${CODEX_HOOKS_DIR.replace(/\\/g, "/")}/${CODEX_WRAPPER_FILE_NAME}`;
 const FILE_EDIT_TOOL_NAMES = new Set([
   "editFiles",
   "createFile",
@@ -302,8 +315,83 @@ export function extractHookFilePaths(input: VSCodeHookInput | null): string[] {
   return [...paths];
 }
 
+function addNormalizedHookPath(paths: Set<string>, value: unknown): void {
+  const filePath = normalizeHookFilePath(value);
+  if (filePath) {
+    paths.add(filePath);
+  }
+}
+
+function extractNestedHookPaths(value: unknown, paths: Set<string>): void {
+  if (typeof value === "string") {
+    addNormalizedHookPath(paths, value);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      extractNestedHookPaths(item, paths);
+    }
+    return;
+  }
+
+  if (!value || typeof value !== "object") {
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  const candidateKeys = [
+    "path",
+    "file",
+    "filePath",
+    "file_path",
+    "target",
+    "targetFile",
+    "target_file",
+    "oldPath",
+    "newPath",
+    "oldFilePath",
+    "newFilePath",
+    "old_file_path",
+    "new_file_path"
+  ];
+
+  for (const key of candidateKeys) {
+    addNormalizedHookPath(paths, record[key]);
+  }
+}
+
 export function extractCodexHookFilePaths(input: CodexHookInput | null): string[] {
-  const command = input?.tool_input?.command;
+  const toolInput = input?.tool_input;
+  if (!toolInput) {
+    return [];
+  }
+
+  const paths = new Set<string>();
+  const directCandidates = [
+    toolInput.filePath,
+    toolInput.file_path,
+    toolInput.path,
+    toolInput.oldFilePath,
+    toolInput.newFilePath,
+    toolInput.old_file_path,
+    toolInput.new_file_path
+  ];
+
+  for (const candidate of directCandidates) {
+    addNormalizedHookPath(paths, candidate);
+  }
+
+  extractNestedHookPaths(toolInput.files, paths);
+  extractNestedHookPaths(toolInput.edits, paths);
+  extractNestedHookPaths(toolInput.writes, paths);
+  extractNestedHookPaths(toolInput.changes, paths);
+
+  if (paths.size > 0) {
+    return [...paths];
+  }
+
+  const command = toolInput.command;
   return typeof command === "string" ? extractCodexHookFilePathsFromText(command) : [];
 }
 
@@ -365,6 +453,10 @@ export function codexHookConfigPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, CODEX_HOOKS_DIR, CODEX_HOOKS_FILE_NAME);
 }
 
+export function codexHookWrapperPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, CODEX_HOOKS_DIR, CODEX_WRAPPER_FILE_NAME);
+}
+
 export function isCodexFileEditEvent(input: CodexHookInput | null): boolean {
   if (!input) {
     return true;
@@ -380,7 +472,191 @@ export function isCodexFileEditEvent(input: CodexHookInput | null): boolean {
 
 export async function installCodexHook(repositoryRoot: string): Promise<string> {
   const hookPath = codexHookConfigPath(repositoryRoot);
+  const wrapperPath = codexHookWrapperPath(repositoryRoot);
   await mkdir(path.dirname(hookPath), { recursive: true });
+  const wrapperContent = `import { spawnSync } from "node:child_process";
+
+function readStdin() {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) {
+      resolve("");
+      return;
+    }
+
+    const chunks = [];
+    process.stdin.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8").trim()));
+  });
+}
+
+function normalizePathValue(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().replace(/\\\\/g, "/");
+  if (!normalized || normalized.startsWith(".anvil/") || normalized === ".codex/hooks.json" || normalized === ".codex/${CODEX_WRAPPER_FILE_NAME}") {
+    return null;
+  }
+
+  return normalized;
+}
+
+function addPath(paths, value) {
+  const normalized = normalizePathValue(value);
+  if (normalized) {
+    paths.add(normalized);
+  }
+}
+
+function collectNestedPaths(value, paths) {
+  if (typeof value === "string") {
+    addPath(paths, value);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectNestedPaths(item, paths);
+    }
+    return;
+  }
+
+  if (!value || typeof value !== "object") {
+    return;
+  }
+
+  const record = value;
+  const candidateKeys = [
+    "path",
+    "file",
+    "filePath",
+    "file_path",
+    "target",
+    "targetFile",
+    "target_file",
+    "oldPath",
+    "newPath",
+    "oldFilePath",
+    "newFilePath",
+    "old_file_path",
+    "new_file_path"
+  ];
+
+  for (const key of candidateKeys) {
+    addPath(paths, record[key]);
+  }
+}
+
+function extractPatchPaths(commandText) {
+  if (typeof commandText !== "string" || !commandText.trim()) {
+    return [];
+  }
+
+  const normalized = commandText
+    .replace(/\\\\r\\\\n/g, "\\n")
+    .replace(/\\\\n/g, "\\n")
+    .replace(/\`r\`n/g, "\\n")
+    .replace(/\`n/g, "\\n");
+
+  const paths = new Set();
+  const patterns = [
+    /^\\*\\*\\* Update File:\\s+(.+)$/gm,
+    /^\\*\\*\\* Add File:\\s+(.+)$/gm,
+    /^\\*\\*\\* Delete File:\\s+(.+)$/gm,
+    /^\\+\\+\\+\\s+b\\/(.+)$/gm,
+    /^---\\s+a\\/(.+)$/gm
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of normalized.matchAll(pattern)) {
+      addPath(paths, match[1]);
+    }
+  }
+
+  return [...paths];
+}
+
+function extractCodexPaths(payload) {
+  const toolInput = payload?.tool_input;
+  if (!toolInput || typeof toolInput !== "object") {
+    return [];
+  }
+
+  const paths = new Set();
+  const directCandidates = [
+    toolInput.filePath,
+    toolInput.file_path,
+    toolInput.path,
+    toolInput.oldFilePath,
+    toolInput.newFilePath,
+    toolInput.old_file_path,
+    toolInput.new_file_path
+  ];
+
+  for (const candidate of directCandidates) {
+    addPath(paths, candidate);
+  }
+
+  collectNestedPaths(toolInput.files, paths);
+  collectNestedPaths(toolInput.edits, paths);
+  collectNestedPaths(toolInput.writes, paths);
+  collectNestedPaths(toolInput.changes, paths);
+
+  if (paths.size > 0) {
+    return [...paths];
+  }
+
+  return extractPatchPaths(toolInput.command);
+}
+
+function runAnvil(args, input = "") {
+  const result = spawnSync("anvil", args, {
+    cwd: process.cwd(),
+    input,
+    encoding: "utf8",
+    shell: process.platform === "win32"
+  });
+
+  if (result.stdout) {
+    process.stdout.write(result.stdout);
+  }
+
+  if (result.stderr) {
+    process.stderr.write(result.stderr);
+  }
+
+  process.exit(result.status ?? 0);
+}
+
+const rawInput = await readStdin();
+let payload = null;
+
+if (rawInput) {
+  try {
+    payload = JSON.parse(rawInput);
+  } catch {
+    runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
+  }
+}
+
+const editedPaths = extractCodexPaths(payload);
+
+if (editedPaths.length > 0) {
+  const normalizedPayload = {
+    hook_event_name: payload?.hook_event_name ?? "PostToolUse",
+    tool_name: payload?.tool_name ?? "apply_patch",
+    tool_input: {
+      command: editedPaths.map((filePath) => \`*** Update File: \${filePath}\`).join("\\n")
+    }
+  };
+
+  runAnvil(["hook", "codex-after-edit", "--codex-hook"], JSON.stringify(normalizedPayload));
+}
+
+runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
+`;
+  await writeFile(wrapperPath, `${wrapperContent}\n`, "utf8");
   const content = JSON.stringify(
     {
       hooks: {
@@ -390,7 +666,7 @@ export async function installCodexHook(repositoryRoot: string): Promise<string> 
             hooks: [
               {
                 type: "command",
-                command: "anvil hook codex-after-edit --codex-hook",
+                command: `node .codex/${CODEX_WRAPPER_FILE_NAME}`,
                 timeout: 30,
                 statusMessage: "Checkpointing Codex edit in Anvil"
               }

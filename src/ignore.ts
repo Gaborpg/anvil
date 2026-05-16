@@ -5,7 +5,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 const EXACT_IGNORED_PATHS = new Set([
   ".anvilignore",
   ".github/hooks/anvil-copilot.json",
-  ".codex/hooks.json"
+  ".codex/hooks.json",
+  ".codex/anvil-codex-after-edit.mjs"
 ]);
 
 const IGNORED_BASENAMES = new Set([

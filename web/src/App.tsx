@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { fetchCheckpoint, fetchDiff, fetchExportPreview, fetchFileSnapshot, fetchTimeline, restoreCheckpoint } from "./api";
+import { deleteBranches, fetchBranches, fetchCheckpoint, fetchDiff, fetchExportPreview, fetchFileSnapshot, fetchTimeline, keepBranches, restoreCheckpoint } from "./api";
 import { parseDiffByFile } from "./diff";
-import type { DiffLine, ExplainItem, FileSnapshotResponse, ParsedDiffFile, RepositoryOption, SideBySideRow, TimelineItem } from "./types";
+import type { BranchSummary, DiffLine, ExplainItem, FileSnapshotResponse, ParsedDiffFile, RepositoryOption, SideBySideRow, TimelineItem } from "./types";
 
 const RECENT_REPOSITORIES_KEY = "anvil.recentRepositories";
 type DiffViewMode = "summary" | "unified" | "side-by-side" | "snapshot";
@@ -39,6 +39,8 @@ export function App() {
   const summaryListRef = useRef<HTMLDivElement | null>(null);
   const summaryCardRefs = useRef<Record<string, HTMLElement | null>>({});
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
+  const [branches, setBranches] = useState<BranchSummary[]>([]);
+  const [selectedBranches, setSelectedBranches] = useState<Record<string, boolean>>({});
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [repositoryName, setRepositoryName] = useState<string>("Repository");
   const [repositoryRoot, setRepositoryRoot] = useState<string>("");
@@ -56,6 +58,7 @@ export function App() {
   const [previewText, setPreviewText] = useState<string>("Export preview will appear here.");
   const [exportMessage, setExportMessage] = useState<string>("Anvil export");
   const [busy, setBusy] = useState<boolean>(false);
+  const [branchBusy, setBranchBusy] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [timelineCollapsed, setTimelineCollapsed] = useState<boolean>(false);
   const [heroCollapsed, setHeroCollapsed] = useState<boolean>(false);
@@ -113,6 +116,7 @@ export function App() {
       saveRecentRepositories(next);
       return next;
     });
+    await loadBranches(response.repositoryRoot);
 
     const latest = items.at(-1)?.checkpointId ?? null;
     setSelectedCheckpointId((current) => {
@@ -130,6 +134,21 @@ export function App() {
       }
 
       return latest;
+    });
+  }
+
+  async function loadBranches(repoOverride?: string) {
+    const repo = repoOverride ?? (selectedRepositoryRoot || undefined);
+    const response = await fetchBranches(repo);
+    setBranches(response.branches);
+    setSelectedBranches((current) => {
+      const next: Record<string, boolean> = {};
+      for (const branch of response.branches) {
+        if (current[branch.branch]) {
+          next[branch.branch] = true;
+        }
+      }
+      return next;
     });
   }
 
@@ -231,6 +250,59 @@ export function App() {
       setBusy(false);
     }
   }
+
+  async function handleDeleteBranches(branchNames: string[]) {
+    if (branchNames.length === 0) {
+      return;
+    }
+
+    setBranchBusy(true);
+    setError(null);
+    try {
+      const response = await deleteBranches(branchNames, selectedRepositoryRoot || undefined);
+      setBranches(response.branches);
+      setSelectedBranches((current) => {
+        const next = { ...current };
+        for (const branch of branchNames) {
+          delete next[branch];
+        }
+        return next;
+      });
+      await loadTimeline();
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    } finally {
+      setBranchBusy(false);
+    }
+  }
+
+  async function handleKeepSelectedBranches() {
+    const branchNames = Object.entries(selectedBranches)
+      .filter(([, selected]) => selected)
+      .map(([branch]) => branch);
+    if (branchNames.length === 0) {
+      return;
+    }
+
+    setBranchBusy(true);
+    setError(null);
+    try {
+      const response = await keepBranches(branchNames, selectedRepositoryRoot || undefined);
+      setBranches(response.branches);
+      setSelectedBranches(
+        Object.fromEntries(branchNames.map((branch) => [branch, true]))
+      );
+      await loadTimeline();
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    } finally {
+      setBranchBusy(false);
+    }
+  }
+
+  const selectedBranchNames = Object.entries(selectedBranches)
+    .filter(([, selected]) => selected)
+    .map(([branch]) => branch);
 
   const selectedFile = parsedFiles.find((file) => file.filePath === selectedFilePath) ?? null;
   const visibleFilePaths =
@@ -531,6 +603,89 @@ export function App() {
         </header>
 
         {error ? <div className="error-banner">{error}</div> : null}
+
+        <section className="card branch-manager-card">
+          <div className="section-heading">
+            <h2>Shadow Branches</h2>
+            <div className="section-actions">
+              <span>{branches.length} branch{branches.length === 1 ? "" : "es"}</span>
+              <button
+                onClick={() =>
+                  setSelectedBranches(
+                    Object.fromEntries(branches.map((branch) => [branch.branch, true]))
+                  )
+                }
+                type="button"
+                disabled={branchBusy || branches.length === 0}
+              >
+                Select All
+              </button>
+              <button
+                onClick={() => setSelectedBranches({})}
+                type="button"
+                disabled={branchBusy || selectedBranchNames.length === 0}
+              >
+                Clear
+              </button>
+              <button
+                onClick={() => void handleDeleteBranches(selectedBranchNames)}
+                type="button"
+                disabled={branchBusy || selectedBranchNames.length === 0}
+              >
+                Delete Selected
+              </button>
+              <button
+                onClick={() => void handleKeepSelectedBranches()}
+                type="button"
+                disabled={branchBusy || selectedBranchNames.length === 0}
+              >
+                Keep Selected
+              </button>
+            </div>
+          </div>
+          {branches.length > 0 ? (
+            <div className="branch-list">
+              {branches.map((branch) => (
+                <label key={branch.branch} className="branch-row">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(selectedBranches[branch.branch])}
+                    onChange={(event) =>
+                      setSelectedBranches((current) => ({
+                        ...current,
+                        [branch.branch]: event.target.checked
+                      }))
+                    }
+                  />
+                  <div className="branch-row-body">
+                    <div className="branch-row-top">
+                      <strong>{branch.branch}</strong>
+                      {branch.branch === currentBranch ? <span className="branch-chip-inline">Current</span> : null}
+                    </div>
+                    <div className="branch-row-meta">
+                      <span>{branch.checkpointCount} checkpoint{branch.checkpointCount === 1 ? "" : "s"}</span>
+                      <span>{branch.latestCheckpointId ?? "none"}</span>
+                      <span>{branch.latestTimestamp ? formatTime(branch.latestTimestamp) : "No timestamp"}</span>
+                    </div>
+                    {branch.shadowRef ? <div className="mono branch-row-ref">{branch.shadowRef}</div> : null}
+                  </div>
+                  <button
+                    onClick={(event) => {
+                      event.preventDefault();
+                      void handleDeleteBranches([branch.branch]);
+                    }}
+                    type="button"
+                    disabled={branchBusy}
+                  >
+                    Delete
+                  </button>
+                </label>
+              ))}
+            </div>
+          ) : (
+            <p>No Anvil shadow branches exist in this repo yet.</p>
+          )}
+        </section>
 
         <section className="content-grid">
           <section className="card files-card">

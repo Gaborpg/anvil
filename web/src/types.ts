@@ -28,6 +28,21 @@ export interface TimelineResponse {
   checkpoints: TimelineItem[];
 }
 
+export interface BranchSummary {
+  branch: string;
+  shadowRef: string | null;
+  checkpointCount: number;
+  latestCheckpointId: string | null;
+  latestTimestamp: string | null;
+}
+
+export interface BranchListResponse {
+  repositoryName: string;
+  repositoryRoot: string;
+  currentBranch: string | null;
+  branches: BranchSummary[];
+}
+
 export interface RepositoryOption {
   name: string;
   root: string;

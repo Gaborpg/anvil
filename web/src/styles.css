@@ -340,6 +340,72 @@ select {
   grid-template-columns: minmax(280px, 0.95fr) minmax(0, 1.4fr);
 }
 
+.branch-manager-card {
+  margin-top: 1.2rem;
+}
+
+.branch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-height: 18rem;
+  overflow: auto;
+  padding-right: 0.2rem;
+}
+
+.branch-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 0.9rem;
+  align-items: start;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.branch-row input {
+  min-width: auto;
+  margin-top: 0.25rem;
+}
+
+.branch-row-body {
+  min-width: 0;
+}
+
+.branch-row-top {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.branch-row-meta {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 0.35rem;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.branch-row-ref {
+  margin-top: 0.35rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.branch-chip-inline {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.28rem 0.55rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
 .mode-bar {
   margin-top: 1.2rem;
   display: flex;

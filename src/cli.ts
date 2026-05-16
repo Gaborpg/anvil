@@ -54,6 +54,7 @@ Usage:
   anvil uninstall
   anvil uninstall -g
   anvil compact --mode keep-last|squash
+  anvil prune [--dry-run] [--max-checkpoints-per-branch 50] [--max-hook-logs 500]
   anvil hook copilot-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "copilot"] [--test-status passed|failed|unknown] [--vscode-hook]
   anvil hook codex-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "codex"] [--test-status passed|failed|unknown] [--codex-hook]
   anvil hook status
@@ -384,6 +385,28 @@ async function main(): Promise<void> {
 
       console.log(`Compacted Anvil history on ${result.gitBranch ?? "unknown"} using mode ${mode}.`);
       console.log(`Retained checkpoint: ${result.checkpointId}`);
+      return;
+    }
+
+    case "prune": {
+      await store.init();
+      const dryRun = args.includes("--dry-run");
+      const maxCheckpointsPerBranchValue = optionValue(args, "--max-checkpoints-per-branch");
+      const maxHookLogsValue = optionValue(args, "--max-hook-logs");
+      const result = await store.prune({
+        dryRun,
+        maxCheckpointsPerBranch: maxCheckpointsPerBranchValue ? Number(maxCheckpointsPerBranchValue) : undefined,
+        maxHookLogs: maxHookLogsValue ? Number(maxHookLogsValue) : undefined
+      });
+
+      console.log(dryRun ? "Anvil prune dry run" : "Anvil prune complete");
+      console.log(`Max checkpoints per branch: ${result.maxCheckpointsPerBranch}`);
+      console.log(`Max hook logs: ${result.maxHookLogs}`);
+      console.log(`Checkpoints removed: ${result.checkpointsRemoved}`);
+      console.log(`Hook log entries removed: ${result.hookLogsRemoved}`);
+      console.log(
+        `Affected branches: ${result.affectedBranches.length > 0 ? result.affectedBranches.join(", ") : "none"}`
+      );
       return;
     }
 

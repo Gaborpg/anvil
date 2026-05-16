@@ -44,6 +44,12 @@ app.get("/api/timeline", async (request, response) => {
   response.json(timeline);
 });
 
+app.get("/api/branches", async (request, response) => {
+  const store = storeForRequest(request);
+  const branches = await store.listBranches();
+  response.json(branches);
+});
+
 app.get("/api/checkpoints/:id", async (request, response) => {
   const store = storeForRequest(request);
   const checkpoint = await store.findCheckpoint(request.params.id);
@@ -92,6 +98,34 @@ app.post("/api/restore", async (request, response) => {
 
   const restoreEvent = await store.restore(checkpointId);
   response.json({ message: `Workspace restored via ${restoreEvent.checkpointId}` });
+});
+
+app.post("/api/branches/delete", async (request, response) => {
+  const store = storeForRequest(request);
+  const branches = request.body?.branches;
+  if (!Array.isArray(branches)) {
+    response.status(400).send("branches is required.");
+    return;
+  }
+
+  const result = await store.deleteBranches(
+    branches.filter((branch): branch is string => typeof branch === "string" && branch.trim().length > 0)
+  );
+  response.json(result);
+});
+
+app.post("/api/branches/keep", async (request, response) => {
+  const store = storeForRequest(request);
+  const branches = request.body?.branches;
+  if (!Array.isArray(branches)) {
+    response.status(400).send("branches is required.");
+    return;
+  }
+
+  const result = await store.keepOnlyBranches(
+    branches.filter((branch): branch is string => typeof branch === "string" && branch.trim().length > 0)
+  );
+  response.json(result);
 });
 
 app.use(express.static(webRoot));

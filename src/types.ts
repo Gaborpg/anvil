@@ -31,6 +31,10 @@ export interface StoreConfig {
   repositoryRoot: string;
   shadowGitDir: string;
   metadataFile: string;
+  retention: {
+    maxCheckpointsPerBranch: number;
+    maxHookLogs: number;
+  };
 }
 
 export interface TimelineResponse {
@@ -39,6 +43,21 @@ export interface TimelineResponse {
   originUrl: string | null;
   currentBranch: string | null;
   checkpoints: CheckpointMetadata[];
+}
+
+export interface BranchSummary {
+  branch: string;
+  shadowRef: string | null;
+  checkpointCount: number;
+  latestCheckpointId: string | null;
+  latestTimestamp: string | null;
+}
+
+export interface BranchListResponse {
+  repositoryName: string;
+  repositoryRoot: string;
+  currentBranch: string | null;
+  branches: BranchSummary[];
 }
 
 export interface FileSnapshotResponse {
@@ -57,4 +76,19 @@ export interface RecordCheckpointOptions {
   commandsRun?: string[];
   testStatus?: "unknown" | "passed" | "failed";
   restoreSourceCheckpointId?: string | null;
+}
+
+export interface PruneOptions {
+  dryRun?: boolean;
+  maxCheckpointsPerBranch?: number;
+  maxHookLogs?: number;
+}
+
+export interface PruneResult {
+  dryRun: boolean;
+  maxCheckpointsPerBranch: number;
+  maxHookLogs: number;
+  checkpointsRemoved: number;
+  hookLogsRemoved: number;
+  affectedBranches: string[];
 }
