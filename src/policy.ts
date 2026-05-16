@@ -477,8 +477,24 @@ function matchesCommandPrefix(command: string, candidates: string[]): string | n
 }
 
 function globFragmentToRegex(fragment: string): RegExp {
-  const escaped = fragment.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-  return new RegExp(`^${escaped.replace(/\\\*/g, ".*").replace(/\\\?/g, ".")}$`, "i");
+  let regex = "^";
+
+  for (const character of fragment) {
+    if (character === "*") {
+      regex += ".*";
+      continue;
+    }
+
+    if (character === "?") {
+      regex += ".";
+      continue;
+    }
+
+    regex += character.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+  }
+
+  regex += "$";
+  return new RegExp(regex, "i");
 }
 
 function matchesPathRule(filePath: string, rule: string): boolean {
