@@ -674,9 +674,10 @@ async function main(): Promise<void> {
 
       const explanation = `${evaluation.category}: ${evaluation.reason}`;
       const additionalContext = `${evaluation.reason} ${evaluation.nextStep}`.trim();
+      const externalDecision = evaluation.decision === "ask" ? "deny" : evaluation.decision;
 
       if (vscodeHookMode) {
-        emitVSCodeGuardDecision(evaluation.decision, explanation, additionalContext);
+        emitVSCodeGuardDecision(externalDecision, explanation, additionalContext);
         return;
       }
 
@@ -686,7 +687,7 @@ async function main(): Promise<void> {
             continue: true,
             hookSpecificOutput: {
               hookEventName: "PreToolUse",
-              permissionDecision: evaluation.decision,
+              permissionDecision: externalDecision,
               permissionDecisionReason: explanation,
               additionalContext
             }
