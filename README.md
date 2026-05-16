@@ -30,13 +30,19 @@ Inside any repo that uses Anvil:
 .anvil/
   config.json
   hooks.yaml
+  policy.yaml
+  extensions.yaml
   metadata.jsonl
+  generated-insights.jsonl
   store.git/
 ```
 
 - `store.git` is the hidden shadow Git repository
 - `metadata.jsonl` is the append-only checkpoint log
 - `hooks.yaml` is the optional repo-local hook config
+- `policy.yaml` is the optional repo-local execution safety policy
+- `extensions.yaml` registers post-checkpoint analysis apps
+- `generated-insights.jsonl` stores structured derived outputs keyed by checkpoint
 - `config.json` also stores retention settings for prune
 - checkpoints are branch-aware
 - each Git branch maps to an internal shadow ref like `refs/anvil/main`
@@ -137,14 +143,20 @@ anvil init
 `anvil init` now bootstraps all the basic repo-local Anvil wiring:
 - `.anvil/config.json`
 - `.anvil/metadata.jsonl`
+- `.anvil/generated-insights.jsonl`
 - `.anvil/store.git`
 - `.anvil/hooks.yaml`
+- `.anvil/policy.yaml`
+- `.anvil/extensions.yaml`
 - `.anvilignore`
 - `.github/hooks/anvil-copilot.json`
+- `.anvil/anvil-execution-guard.mjs`
 - `.codex/anvil-codex-after-edit.mjs`
 - `.codex/hooks.json`
 
 The Copilot and Codex hooks are installed, but auto-checkpointing stays disabled until you set `autoCheckpoint: true` in `.anvil/hooks.yaml`.
+The shared execution guard is also installed, but it stays inactive until you set `executionGuard.enabled: true` in `.anvil/policy.yaml`.
+Anvil also creates `.anvil/extensions.yaml`, which is where declared post-checkpoint analysis apps are registered.
 If `.gitignore` exists, `anvil init` copies it into `.anvilignore` as a starting point so you can customize Anvil-specific ignores from there.
 
 Or skip that and just use any normal Anvil command. Most commands auto-initialize `.anvil/` on first use.
@@ -175,6 +187,8 @@ anvil review --port 4313
 anvil init
 anvil install-codex-hook
 anvil install-copilot-hook
+anvil guard evaluate [--vscode-hook|--codex-hook]
+anvil repair-baseline
 anvil review [--port 4312]
 anvil checkpoint --summary "Updated parser logic"
 anvil hook codex-after-edit
@@ -451,6 +465,195 @@ This reports:
 
 This is the fastest way to debug “why didn’t the hook run?” before chasing editor-specific behavior.
 
+## Execution Safety Guard
+
+Anvil can also install a repo-local pre-execution safety layer for AI-triggered tool calls.
+
+What it is:
+- one shared repo-local guard script:
+  ```text
+  .anvil/anvil-execution-guard.mjs
+  ```
+- one repo-local policy file:
+  ```text
+  .anvil/policy.yaml
+  ```
+- Codex and Copilot pre-tool hooks both call the same guard
+
+The guard is installed by:
+- `anvil init`
+- `anvil install-codex-hook`
+- `anvil install-copilot-hook`
+
+But it is disabled by default. To enable it:
+
+```yaml
+executionGuard:
+  enabled: true
+```
+
+### Default Model
+
+The first version is:
+- allow by default
+- deny clearly destructive operations
+- ask for medium-risk operations
+
+Built-in deny examples:
+- `git reset --hard`
+- `git clean -fdx`
+- `git push --force`
+- `rm -rf`
+- `npm publish`
+- `dotnet nuget push`
+- destructive database reset/drop commands
+- AI edits to `.git/`, `.anvil/`, `.codex/`, `.env`, keys, and similar sensitive files
+
+Built-in ask examples:
+- package installs like `npm install`, `pnpm add`, `dotnet add package`
+- migrations like `dotnet ef`, `prisma migrate`, `rails db:migrate`
+- outbound fetch commands like `curl`, `wget`, `Invoke-WebRequest`
+- edits to `package.json`, lockfiles, workflow files, `Dockerfile`, and `*.csproj`
+- broad rewrites touching more than the configured file threshold
+
+Built-in allow examples:
+- common test commands like `npm test`, `vitest`, `dotnet test`, `pytest`
+- common build/dev commands like `npm run build`, `vite`, `ng serve`, `dotnet build`, `dotnet run`
+
+### Policy File
+
+Starter policy created by `anvil init` looks like:
+
+```yaml
+executionGuard:
+  enabled: false
+  maxFilesBeforeAsk: 20
+
+  allowedTestCommands:
+    - npm test
+    - dotnet test
+
+  allowedBuildCommands:
+    - npm run build
+    - dotnet build
+
+  askCommands:
+    - npm install
+    - dotnet ef
+
+  denyCommands:
+    - git reset --hard
+    - npm publish
+
+  askPaths:
+    - package.json
+    - .github/workflows/
+
+  denyPaths:
+    - .git/
+    - .anvil/
+    - .codex/
+    - .env
+```
+
+### Guard Behavior
+
+When the guard sees a tool call, it returns one of:
+- `allow`
+- `ask`
+- `deny`
+
+Each result includes:
+- a category
+- a reason
+- a suggested next step
+
+Examples:
+- `DENY destructive-git: git reset --hard is blocked by Anvil execution policy.`
+- `ASK package-install: pnpm add requires explicit approval in this repo.`
+
+This layer is for AI-triggered tool execution only in v1. It is not a full shell sandbox for all human terminal commands.
+
+## Post-Checkpoint Extension Apps
+
+Anvil can also run declared review/analysis apps after a checkpoint is already committed.
+
+This is separate from the execution guard:
+- `policy.yaml` controls pre-execution safety
+- `extensions.yaml` registers post-checkpoint apps
+
+### How It Works
+
+1. Anvil records a checkpoint.
+2. The checkpoint id is queued internally.
+3. Anvil launches enabled extension apps in best-effort background mode.
+4. Extension apps receive normalized checkpoint JSON on stdin.
+5. They return structured insight JSON on stdout.
+6. Anvil stores those results in:
+   ```text
+   .anvil/generated-insights.jsonl
+   ```
+
+This keeps checkpoint history authoritative while allowing derived outputs like:
+- review hints
+- risk reports
+- file-priority suggestions
+- branch health summaries
+
+### Extension Registration
+
+`anvil init` creates:
+
+```text
+.anvil/extensions.yaml
+```
+
+Starter example:
+
+```yaml
+extensions:
+  reviewHints:
+    enabled: false
+    command: node .anvil/apps/review-hints.mjs
+    description: "Generate structured checkpoint review hints"
+```
+
+### Extension Contract
+
+An extension receives stdin like:
+
+```json
+{
+  "version": 1,
+  "repositoryRoot": "C:/path/to/repo",
+  "checkpoint": {
+    "checkpointId": "cp-12",
+    "summary": "Refactor parser",
+    "filesChanged": ["src/parser.ts"]
+  }
+}
+```
+
+It should return stdout like:
+
+```json
+{
+  "insights": [
+    {
+      "type": "review-hint",
+      "title": "Review parser.ts first",
+      "body": "The checkpoint touched parsing logic and may affect downstream validation.",
+      "files": ["src/parser.ts"]
+    }
+  ]
+}
+```
+
+Important:
+- extensions are best-effort
+- they do not block checkpoint creation
+- they are intended for review/analysis outputs, not arbitrary execution control
+
 ## Timeline
 
 See the current branch timeline:
@@ -682,6 +885,14 @@ If the browser is blank or stale:
 If a repo has no Anvil history:
 - run `anvil checkpoint --summary "..."` after making file changes
 - then refresh `anvil review`
+
+If an older repo still shows a full-project diff on its first checkpoint after upgrading Anvil:
+
+```bash
+anvil repair-baseline
+```
+
+This recreates the current branch's hidden Anvil baseline from the current Git `HEAD` tree and re-anchors the first checkpoint on that branch to it.
 
 If you want to reset everything for a repo:
 

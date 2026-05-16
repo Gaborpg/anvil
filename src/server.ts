@@ -61,6 +61,12 @@ app.get("/api/checkpoints/:id", async (request, response) => {
   response.json(checkpoint);
 });
 
+app.get("/api/checkpoints/:id/insights", async (request, response) => {
+  const store = storeForRequest(request);
+  const insights = await store.generatedInsights(request.params.id);
+  response.json({ insights });
+});
+
 app.get("/api/checkpoints/:id/file", async (request, response) => {
   const store = storeForRequest(request);
   const filePath = typeof request.query.path === "string" ? request.query.path : "";

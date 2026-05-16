@@ -100,3 +100,14 @@ export interface PruneResult {
   hookLogsRemoved: number;
   affectedBranches: string[];
 }
+
+export interface GeneratedInsightRecord {
+  checkpointId: string;
+  extensionId: string;
+  insightType: string;
+  title: string;
+  body: string;
+  files?: string[];
+  createdAt: string;
+  source: "extension" | "builtin";
+}

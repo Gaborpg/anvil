@@ -1,7 +1,9 @@
 import path from "node:path";
+import process from "node:process";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import type { CheckpointKind } from "./types.js";
+import { ensureExecutionGuardScript, executionGuardScriptPath } from "./policy.js";
 
 export interface CopilotHookConfig {
   autoCheckpoint: boolean;
@@ -63,8 +65,23 @@ export interface CodexHookInput {
 
 export interface HookExecutionLogEntry {
   timestamp: string;
-  hookName: "copilot-after-edit" | "codex-after-edit" | "codex-prompt-submit" | "copilot-prompt-submit";
-  status: "invalid_payload" | "ignored" | "disabled" | "no_changes" | "recorded" | "captured";
+  hookName:
+    | "copilot-after-edit"
+    | "codex-after-edit"
+    | "codex-prompt-submit"
+    | "copilot-prompt-submit"
+    | "copilot-pre-tool-use"
+    | "codex-pre-tool-use";
+  status:
+    | "invalid_payload"
+    | "ignored"
+    | "disabled"
+    | "no_changes"
+    | "recorded"
+    | "captured"
+    | "allowed"
+    | "asked"
+    | "denied";
   mode: "cli" | "vscode-hook" | "codex-hook";
   branch?: string;
   checkpointId?: string;
@@ -95,6 +112,21 @@ const FILE_EDIT_TOOL_NAMES = new Set([
   "delete_file",
   "replace_string_in_file"
 ]);
+
+function currentCliEntrypoint(): string {
+  return process.argv[1] ? path.resolve(process.argv[1]) : "";
+}
+
+function currentNodeExecutable(): string {
+  return process.execPath;
+}
+
+function shellCommandForCurrentCli(args: string[]): string {
+  const nodeExecutable = currentNodeExecutable().replace(/"/g, '\\"');
+  const cliEntrypoint = currentCliEntrypoint().replace(/"/g, '\\"');
+  const escapedArgs = args.map((value) => value.replace(/"/g, '\\"'));
+  return `"${nodeExecutable}" "${cliEntrypoint}" ${escapedArgs.map((value) => `"${value}"`).join(" ")}`;
+}
 
 export function hookConfigPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, ".anvil", HOOKS_FILE_NAME);
@@ -694,21 +726,29 @@ export function extractVSCodeHookRationale(input: VSCodeHookInput | null): strin
 
 export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<string> {
   const hookPath = vscodeCopilotHookConfigPath(repositoryRoot);
+  const guardScript = await ensureExecutionGuardScript(repositoryRoot);
   await mkdir(path.dirname(hookPath), { recursive: true });
   const content = JSON.stringify(
     {
       hooks: {
+        PreToolUse: [
+          {
+            type: "command",
+            command: `node ${path.relative(repositoryRoot, guardScript).replace(/\\/g, "/")} --host copilot`,
+            timeout: 10
+          }
+        ],
         UserPromptSubmit: [
           {
             type: "command",
-            command: "anvil hook copilot-prompt-submit --vscode-hook",
+            command: shellCommandForCurrentCli(["hook", "copilot-prompt-submit", "--vscode-hook"]),
             timeout: 15
           }
         ],
         PostToolUse: [
           {
             type: "command",
-            command: "anvil hook copilot-after-edit --vscode-hook",
+            command: shellCommandForCurrentCli(["hook", "copilot-after-edit", "--vscode-hook"]),
             timeout: 30
           }
         ]
@@ -753,6 +793,9 @@ export function isCodexPromptSubmitEvent(input: CodexHookInput | null): boolean 
 export async function installCodexHook(repositoryRoot: string): Promise<string> {
   const hookPath = codexHookConfigPath(repositoryRoot);
   const wrapperPath = codexHookWrapperPath(repositoryRoot);
+  const guardScript = await ensureExecutionGuardScript(repositoryRoot);
+  const cliEntrypoint = currentCliEntrypoint();
+  const nodeExecutable = currentNodeExecutable();
   await mkdir(path.dirname(hookPath), { recursive: true });
   const wrapperContent = `import { spawnSync } from "node:child_process";
 
@@ -891,11 +934,11 @@ function extractCodexPaths(payload) {
 }
 
 function runAnvil(args, input = "") {
-  const result = spawnSync("anvil", args, {
+  const result = spawnSync(${JSON.stringify(nodeExecutable)}, [${JSON.stringify(cliEntrypoint)}, ...args], {
     cwd: process.cwd(),
     input,
     encoding: "utf8",
-    shell: process.platform === "win32"
+    shell: false
   });
 
   if (result.stdout) {
@@ -967,6 +1010,18 @@ runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
   const content = JSON.stringify(
     {
       hooks: {
+        PreToolUse: [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: `node ${path.relative(repositoryRoot, guardScript).replace(/\\/g, "/")} --host codex`,
+                timeout: 10,
+                statusMessage: "Checking Anvil execution policy"
+              }
+            ]
+          }
+        ],
         PostToolUse: [
           {
             matcher: "^apply_patch$|^Edit$|^Write$",
@@ -985,7 +1040,7 @@ runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
             hooks: [
               {
                 type: "command",
-                command: "anvil hook codex-prompt-submit --codex-hook",
+                command: shellCommandForCurrentCli(["hook", "codex-prompt-submit", "--codex-hook"]),
                 timeout: 15,
                 statusMessage: "Capturing Codex prompt for Anvil"
               }

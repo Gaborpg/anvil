@@ -38,12 +38,26 @@ import {
 } from "./hooks.js";
 import { getRepositoryRoot } from "./git.js";
 import {
+  appendGeneratedInsights,
+  consumePendingExtensionEvents,
+  ensureExtensionsTemplate,
+  loadExtensionsConfig,
+  type ExtensionCheckpointPayload,
+  type ExtensionRunnerOutput
+} from "./extensions.js";
+import {
   collectIgnoredAnvilPaths,
   ensureAnvilIgnoreTemplate,
   filterIgnoredAnvilPaths,
   loadAnvilIgnoreRules,
   type AnvilIgnoreRules
 } from "./ignore.js";
+import {
+  ensurePolicyTemplate,
+  evaluateExecutionGuard,
+  executionGuardScriptPath,
+  loadExecutionGuardPolicy
+} from "./policy.js";
 import { CheckpointStore } from "./store.js";
 import type { CheckpointKind } from "./types.js";
 import { formatTimestamp } from "./utils.js";
@@ -64,6 +78,8 @@ Usage:
   anvil install -g
   anvil install-codex-hook
   anvil install-copilot-hook
+  anvil guard evaluate [--vscode-hook|--codex-hook]
+  anvil repair-baseline
   anvil uninstall
   anvil uninstall -g
   anvil compact --mode keep-last|squash
@@ -79,8 +95,8 @@ Usage:
   anvil diff [checkpoint] [checkpoint]
   anvil restore <checkpoint>
   anvil explain <checkpoint>
-  anvil assign-branch <checkpoint> [branch]
-  anvil export [--preview] [--message "message"]
+anvil assign-branch <checkpoint> [branch]
+anvil export [--preview] [--message "message"]
 
 Internal:
   anvil __record --kind <kind> --summary "summary" [--files a,b] [--command "..."] [--prompt "..."] [--rationale "..."] [--test-status passed|failed|unknown]
@@ -105,6 +121,52 @@ function parsePathList(value: string | null): string[] {
     .split(",")
     .map((item) => item.trim().replace(/\\/g, "/"))
     .filter(Boolean);
+}
+
+function extractVSCodeGuardCommand(input: VSCodeHookInput | null): string | null {
+  if (!input?.tool_input || typeof input.tool_input !== "object") {
+    return null;
+  }
+
+  const toolInput = input.tool_input as Record<string, unknown>;
+  const candidates = [
+    toolInput.command,
+    toolInput.cmd,
+    toolInput.script,
+    toolInput.args,
+    toolInput.arguments
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
+}
+
+function extractCodexGuardCommand(input: CodexHookInput | null): string | null {
+  if (!input?.tool_input || typeof input.tool_input !== "object") {
+    return null;
+  }
+
+  const toolInput = input.tool_input as Record<string, unknown>;
+  const candidates = [
+    toolInput.command,
+    toolInput.cmd,
+    toolInput.script,
+    toolInput.args,
+    toolInput.arguments
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
 }
 
 async function readStdInText(): Promise<string> {
@@ -134,6 +196,24 @@ function emitVSCodeHookResponse(additionalContext?: string): void {
   console.log(JSON.stringify(payload));
 }
 
+function emitVSCodeGuardDecision(
+  decision: "allow" | "ask" | "deny",
+  reason: string,
+  additionalContext?: string
+): void {
+  console.log(
+    JSON.stringify({
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: decision,
+        permissionDecisionReason: reason,
+        ...(additionalContext ? { additionalContext } : {})
+      }
+    })
+  );
+}
+
 async function runStreamingCommand(command: string, args: string[], cwd: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
@@ -152,6 +232,106 @@ async function runStreamingCommand(command: string, args: string[], cwd: string)
       reject(new Error(`${command} ${args.join(" ")} exited with code ${code ?? "unknown"}`));
     });
   });
+}
+
+async function runCommandWithInput(command: string, cwd: string, input: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const child = spawn(
+      process.platform === "win32" ? "cmd.exe" : "/bin/sh",
+      process.platform === "win32" ? ["/d", "/s", "/c", command] : ["-lc", command],
+      {
+        cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true
+      }
+    );
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) {
+        resolve(stdout.trim());
+        return;
+      }
+
+      reject(new Error(stderr.trim() || `${command} exited with code ${code ?? "unknown"}`));
+    });
+
+    child.stdin.write(input);
+    child.stdin.end();
+  });
+}
+
+function launchExtensionProcessor(repositoryRoot: string): void {
+  const scriptPath = process.argv[1];
+  if (!scriptPath) {
+    return;
+  }
+
+  const child = spawn(process.execPath, [...process.execArgv, scriptPath, "__process-extensions"], {
+    cwd: repositoryRoot,
+    stdio: "ignore",
+    detached: true,
+    windowsHide: true
+  });
+  child.unref();
+}
+
+async function runRegisteredExtensions(
+  repositoryRoot: string,
+  store: CheckpointStore,
+  checkpointId: string
+): Promise<void> {
+  const checkpoint = await store.findCheckpoint(checkpointId);
+  if (!checkpoint) {
+    return;
+  }
+
+  const config = await loadExtensionsConfig(repositoryRoot);
+  const enabled = config.extensions.filter((extension) => extension.enabled);
+  if (enabled.length === 0) {
+    return;
+  }
+
+  const payload: ExtensionCheckpointPayload = {
+    version: 1,
+    repositoryRoot,
+    checkpoint
+  };
+
+  for (const extension of enabled) {
+    try {
+      const stdout = await runCommandWithInput(extension.command, repositoryRoot, JSON.stringify(payload));
+      if (!stdout) {
+        continue;
+      }
+
+      const parsed = JSON.parse(stdout) as ExtensionRunnerOutput;
+      const insights = (parsed.insights ?? [])
+        .filter((item) => item && typeof item.type === "string" && typeof item.title === "string" && typeof item.body === "string")
+        .map((item) => ({
+          checkpointId,
+          extensionId: extension.id,
+          insightType: item.type,
+          title: item.title,
+          body: item.body,
+          files: Array.isArray(item.files) ? item.files.filter((file): file is string => typeof file === "string") : undefined,
+          createdAt: new Date().toISOString(),
+          source: "extension" as const
+        }));
+
+      await appendGeneratedInsights(repositoryRoot, insights);
+    } catch {
+      // Extension execution is best-effort and should not break checkpoint flow.
+    }
+  }
 }
 
 async function gitStatusFiles(cwd: string, ignoreRules?: AnvilIgnoreRules): Promise<string[]> {
@@ -231,15 +411,20 @@ async function printHookStatus(
 ): Promise<void> {
   const branch = await resolvedBranchLabel(store);
   const config = await loadHookConfig(repositoryRoot);
+  const policy = await loadExecutionGuardPolicy(repositoryRoot);
   const hookConfigFile = hookConfigPath(repositoryRoot);
   const copilotHookFile = vscodeCopilotHookConfigPath(repositoryRoot);
   const codexHookFile = codexHookConfigPath(repositoryRoot);
+  const policyFile = path.join(repositoryRoot, ".anvil", "policy.yaml");
+  const extensionsFile = path.join(repositoryRoot, ".anvil", "extensions.yaml");
+  const guardScriptFile = executionGuardScriptPath(repositoryRoot);
   const anvilIgnoreFile = path.join(repositoryRoot, ".anvilignore");
   const ignorePatternCount = ignoreRules?.patterns.length ?? 0;
   const gitStatus = await gitStatusSnapshot(repositoryRoot, ignoreRules);
 
   const copilotReady = existsSync(copilotHookFile) && Boolean(config.copilot?.autoCheckpoint);
   const codexReady = existsSync(codexHookFile) && Boolean(config.codex?.autoCheckpoint);
+  const executionGuardReady = existsSync(copilotHookFile) && existsSync(codexHookFile) && existsSync(guardScriptFile) && policy.enabled;
   const lastHookExecution = await readLastHookExecutionLog(repositoryRoot);
 
   console.log("Anvil hook status\n");
@@ -247,8 +432,12 @@ async function printHookStatus(
   console.log("");
   console.log("Hook config");
   console.log(`  ${formatStatusLine(".anvil/hooks.yaml", existsSync(hookConfigFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".anvil/policy.yaml", existsSync(policyFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".anvil/extensions.yaml", existsSync(extensionsFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".anvil/anvil-execution-guard.mjs", existsSync(guardScriptFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine("copilot.autoCheckpoint", String(config.copilot?.autoCheckpoint ?? false))}`);
   console.log(`  ${formatStatusLine("codex.autoCheckpoint", String(config.codex?.autoCheckpoint ?? false))}`);
+  console.log(`  ${formatStatusLine("executionGuard.enabled", String(policy.enabled))}`);
   console.log("");
   console.log("Installed hook files");
   console.log(`  ${formatStatusLine(".github/hooks/anvil-copilot.json", existsSync(copilotHookFile) ? "present" : "missing")}`);
@@ -268,6 +457,7 @@ async function printHookStatus(
   console.log("Ready state");
   console.log(`  ${formatStatusLine("Copilot hook ready", copilotReady ? "yes" : "no")}`);
   console.log(`  ${formatStatusLine("Codex hook ready", codexReady ? "yes" : "no")}`);
+  console.log(`  ${formatStatusLine("Execution guard ready", executionGuardReady ? "yes" : "no")}`);
   console.log("");
   console.log("Last hook execution");
   if (lastHookExecution) {
@@ -318,6 +508,8 @@ async function main(): Promise<void> {
       const hookPath = await installVSCodeCopilotHook(repositoryRoot);
       const codexHookPath = await installCodexHook(repositoryRoot);
       const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
+      const policyTemplate = await ensurePolicyTemplate(repositoryRoot);
+      const extensionsTemplate = await ensureExtensionsTemplate(repositoryRoot);
       const anvilIgnore = await ensureAnvilIgnoreTemplate(repositoryRoot);
       console.log(`Anvil initialized for ${repositoryRoot}`);
       console.log(`State directory: ${path.dirname(config.shadowGitDir)}`);
@@ -327,12 +519,15 @@ async function main(): Promise<void> {
       console.log(`Copilot hook: ${hookPath}`);
       console.log(`Codex hook: ${codexHookPath}`);
       console.log(`Hook config: ${hookConfigPath}`);
+      console.log(`Execution policy: ${policyTemplate.filePath}`);
+      console.log(`Extensions config: ${extensionsTemplate.filePath}`);
       if (anvilIgnore.source === "gitignore") {
         console.log("Anvil ignore was created by copying .gitignore.");
       } else if (anvilIgnore.source === "starter") {
         console.log("Anvil ignore was created with a starter template because .gitignore was not found.");
       }
       console.log("Copilot and Codex auto-checkpoint remain disabled until you set autoCheckpoint: true in .anvil/hooks.yaml.");
+      console.log("Execution safety remains disabled until you set executionGuard.enabled: true in .anvil/policy.yaml.");
       return;
     }
 
@@ -352,8 +547,12 @@ async function main(): Promise<void> {
       await store.init();
       const hookPath = await installVSCodeCopilotHook(repositoryRoot);
       const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
+      const policyTemplate = await ensurePolicyTemplate(repositoryRoot);
+      const extensionsTemplate = await ensureExtensionsTemplate(repositoryRoot);
       console.log(`Installed VS Code Copilot hook at ${hookPath}`);
       console.log(`Hook config: ${hookConfigPath}`);
+      console.log(`Execution policy: ${policyTemplate.filePath}`);
+      console.log(`Extensions config: ${extensionsTemplate.filePath}`);
       console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Copilot file edits.");
       return;
     }
@@ -362,9 +561,151 @@ async function main(): Promise<void> {
       await store.init();
       const hookPath = await installCodexHook(repositoryRoot);
       const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
+      const policyTemplate = await ensurePolicyTemplate(repositoryRoot);
+      const extensionsTemplate = await ensureExtensionsTemplate(repositoryRoot);
       console.log(`Installed Codex hook at ${hookPath}`);
       console.log(`Hook config: ${hookConfigPath}`);
+      console.log(`Execution policy: ${policyTemplate.filePath}`);
+      console.log(`Extensions config: ${extensionsTemplate.filePath}`);
       console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Codex file edits.");
+      return;
+    }
+
+    case "repair-baseline": {
+      await store.init();
+      const result = await store.repairCurrentBranchBaseline();
+      console.log(`Repaired Anvil baseline for branch ${result.branch}.`);
+      console.log(`Shadow ref: ${result.shadowRef}`);
+      console.log(`Baseline commit: ${result.baselineSha}`);
+      if (result.updatedCheckpointId) {
+        console.log(`Updated first checkpoint: ${result.updatedCheckpointId}`);
+      } else {
+        console.log("No checkpoints existed on this branch yet; the shadow ref now points at the repaired baseline.");
+      }
+      return;
+    }
+
+    case "guard": {
+      if (args[0] !== "evaluate") {
+        throw new Error("Unknown guard command. Supported: evaluate");
+      }
+
+      await store.init();
+      const vscodeHookMode = args.includes("--vscode-hook");
+      const codexHookMode = args.includes("--codex-hook");
+      const hookMode = vscodeHookMode ? "vscode-hook" : codexHookMode ? "codex-hook" : "cli";
+      const stdInText = vscodeHookMode || codexHookMode ? await readStdInText() : "";
+      let vscodeHookInput: VSCodeHookInput | null = null;
+      let codexHookInput: CodexHookInput | null = null;
+
+      if (vscodeHookMode && stdInText) {
+        try {
+          vscodeHookInput = JSON.parse(stdInText) as VSCodeHookInput;
+        } catch {
+          await appendHookExecutionLog(repositoryRoot, {
+            timestamp: new Date().toISOString(),
+            hookName: "copilot-pre-tool-use",
+            status: "invalid_payload",
+            mode: hookMode,
+            message: "Could not parse VS Code PreToolUse payload."
+          });
+          emitVSCodeGuardDecision("deny", "Anvil execution guard could not parse the tool payload.");
+          return;
+        }
+      }
+
+      if (codexHookMode && stdInText) {
+        try {
+          codexHookInput = JSON.parse(stdInText) as CodexHookInput;
+        } catch {
+          await appendHookExecutionLog(repositoryRoot, {
+            timestamp: new Date().toISOString(),
+            hookName: "codex-pre-tool-use",
+            status: "invalid_payload",
+            mode: hookMode,
+            message: "Could not parse Codex PreToolUse payload."
+          });
+          console.log(
+            JSON.stringify({
+              continue: true,
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "deny",
+                permissionDecisionReason: "Anvil execution guard could not parse the tool payload."
+              }
+            })
+          );
+          return;
+        }
+      }
+
+      const toolName = vscodeHookInput?.tool_name ?? codexHookInput?.tool_name ?? "unknown";
+      const commandText = vscodeHookMode
+        ? extractVSCodeGuardCommand(vscodeHookInput)
+        : codexHookMode
+          ? extractCodexGuardCommand(codexHookInput)
+          : optionValue(args, "--command");
+      const filePaths = vscodeHookMode
+        ? extractHookFilePaths(vscodeHookInput)
+        : codexHookMode
+          ? extractCodexHookFilePaths(codexHookInput)
+          : parsePathList(optionValue(args, "--files"));
+      const policy = await loadExecutionGuardPolicy(repositoryRoot);
+      const evaluation = evaluateExecutionGuard(policy, {
+        toolName,
+        commandText,
+        filePaths
+      });
+      const hookName = vscodeHookMode ? "copilot-pre-tool-use" : "codex-pre-tool-use";
+      await appendHookExecutionLog(repositoryRoot, {
+        timestamp: new Date().toISOString(),
+        hookName,
+        status:
+          evaluation.decision === "allow"
+            ? "allowed"
+            : evaluation.decision === "ask"
+              ? "asked"
+              : "denied",
+        mode: hookMode,
+        branch: await resolvedBranchLabel(store),
+        files: filePaths.length > 0 ? filePaths : undefined,
+        message: `${evaluation.category}: ${evaluation.reason} ${evaluation.nextStep}`.trim()
+      });
+
+      const explanation = `${evaluation.category}: ${evaluation.reason}`;
+      const additionalContext = `${evaluation.reason} ${evaluation.nextStep}`.trim();
+
+      if (vscodeHookMode) {
+        emitVSCodeGuardDecision(evaluation.decision, explanation, additionalContext);
+        return;
+      }
+
+      if (codexHookMode) {
+        console.log(
+          JSON.stringify({
+            continue: true,
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse",
+              permissionDecision: evaluation.decision,
+              permissionDecisionReason: explanation,
+              additionalContext
+            }
+          })
+        );
+        return;
+      }
+
+      console.log(`${evaluation.decision.toUpperCase()} ${evaluation.category}: ${evaluation.reason}`);
+      console.log(evaluation.nextStep);
+      return;
+    }
+
+    case "__process-extensions": {
+      await store.init();
+      const checkpointIds = await consumePendingExtensionEvents(repositoryRoot);
+      for (const checkpointId of checkpointIds) {
+        await runRegisteredExtensions(repositoryRoot, store, checkpointId);
+      }
       return;
     }
 
@@ -719,13 +1060,16 @@ async function main(): Promise<void> {
       });
 
       if (vscodeHookMode) {
+        launchExtensionProcessor(repositoryRoot);
         emitVSCodeHookResponse(`Anvil recorded checkpoint ${checkpoint.checkpointId} on branch ${checkpoint.gitBranch ?? "unknown"}.`);
         return;
       }
       if (codexHookMode) {
+        launchExtensionProcessor(repositoryRoot);
         return;
       }
 
+      launchExtensionProcessor(repositoryRoot);
       console.log(`Recorded ${checkpoint.checkpointId}`);
       console.log(`Branch: ${checkpoint.gitBranch ?? "unknown"}`);
       console.log(`Shadow ref: ${checkpoint.shadowRef ?? "unknown"}`);
@@ -818,6 +1162,7 @@ async function main(): Promise<void> {
         testStatus: testStatus ?? "unknown"
       });
 
+      launchExtensionProcessor(repositoryRoot);
       console.log(`Recorded ${checkpoint.checkpointId}`);
       printRepositoryContext(repositoryRoot, launchCwd, checkpoint.gitBranch ?? branch);
       console.log(`Shadow ref: ${checkpoint.shadowRef ?? "unknown"}`);
@@ -851,6 +1196,7 @@ async function main(): Promise<void> {
       }
 
       const restoreEvent = await store.restore(checkpointId);
+      launchExtensionProcessor(repositoryRoot);
       console.log(`Workspace restored. Recorded ${restoreEvent.checkpointId}.`);
       return;
     }
@@ -913,6 +1259,9 @@ async function main(): Promise<void> {
       const previewOnly = args.includes("--preview");
       const message = optionValue(args, "--message") ?? "AI export";
       const result = await store.exportToGit(message, previewOnly);
+      if (!previewOnly) {
+        launchExtensionProcessor(repositoryRoot);
+      }
       console.log(result);
       return;
     }
@@ -945,6 +1294,7 @@ async function main(): Promise<void> {
         testStatus: testStatus ?? "unknown"
       });
 
+      launchExtensionProcessor(repositoryRoot);
       console.log(`Recorded ${checkpoint.checkpointId}`);
       return;
     }

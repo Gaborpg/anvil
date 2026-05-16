@@ -24,6 +24,17 @@ export interface ExplainItem extends TimelineItem {
   restoreSourceCheckpointId: string | null;
 }
 
+export interface GeneratedInsightItem {
+  checkpointId: string;
+  extensionId: string;
+  insightType: string;
+  title: string;
+  body: string;
+  files?: string[];
+  createdAt: string;
+  source: "extension" | "builtin";
+}
+
 export interface TimelineResponse {
   repositoryName: string;
   repositoryRoot: string;

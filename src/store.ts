@@ -1,9 +1,10 @@
 import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { existsSync } from "node:fs";
+import { appendPendingExtensionEvent, readGeneratedInsights } from "./extensions.js";
 import { getCurrentBranch, getHeadReflogMessages, getOriginUrl, runGit, runGitRaw } from "./git.js";
 import { filterIgnoredAnvilPaths, isIgnoredAnvilPath, loadAnvilIgnoreRules, type AnvilIgnoreRules } from "./ignore.js";
-import type { BranchListResponse, BranchSummary, CheckpointMetadata, FileSnapshotResponse, PruneOptions, PruneResult, RecordCheckpointOptions, StoreConfig, TimelineResponse } from "./types.js";
+import type { BranchListResponse, BranchSummary, CheckpointMetadata, FileSnapshotResponse, GeneratedInsightRecord, PruneOptions, PruneResult, RecordCheckpointOptions, StoreConfig, TimelineResponse } from "./types.js";
 import { checkpointNumber, ensureDir, hashText, readJson, writeJson } from "./utils.js";
 
 const STORE_DIR_NAME = ".anvil";
@@ -34,6 +35,13 @@ interface WorkspaceStatusEntry {
 interface ChangedPathSet {
   checkout: string[];
   remove: string[];
+}
+
+interface RepairBranchBaselineResult {
+  branch: string;
+  shadowRef: string;
+  baselineSha: string;
+  updatedCheckpointId: string | null;
 }
 
 export class CheckpointStore {
@@ -709,7 +717,12 @@ export class CheckpointStore {
     };
 
     await appendFile(this.metadataFile, `${JSON.stringify(metadata)}\n`, "utf8");
+    await appendPendingExtensionEvent(this.repositoryRoot, checkpointId);
     return metadata;
+  }
+
+  async generatedInsights(checkpointId: string): Promise<GeneratedInsightRecord[]> {
+    return readGeneratedInsights(this.repositoryRoot, checkpointId);
   }
 
   async diff(fromId?: string, toId?: string): Promise<string> {
@@ -1166,5 +1179,53 @@ export class CheckpointStore {
       .filter((branch) => !keepSet.has(branch));
 
     return this.deleteBranches(branchesToDelete);
+  }
+
+  async repairCurrentBranchBaseline(): Promise<RepairBranchBaselineResult> {
+    await this.loadConfig();
+    const branch = await this.currentBranch();
+    if (!branch) {
+      throw new Error("Cannot repair an Anvil baseline without an active Git branch.");
+    }
+
+    const shadowRef = this.shadowRefForBranch(branch);
+    const headTreeSha = await runGit(["rev-parse", "HEAD^{tree}"], this.repositoryRoot);
+    const baselineSha = await this.commitTree(headTreeSha, `anvil baseline repair ${branch}`);
+    const checkpoints = await this.readMetadata();
+    const branchCheckpoints = checkpoints.filter((entry) => entry.gitBranch === branch);
+
+    if (branchCheckpoints.length === 0) {
+      await this.updateShadowRef(shadowRef, baselineSha);
+      await this.pointShadowHeadAt(shadowRef);
+      return {
+        branch,
+        shadowRef,
+        baselineSha,
+        updatedCheckpointId: null
+      };
+    }
+
+    const firstCheckpoint = branchCheckpoints[0];
+    const updatedMetadata = checkpoints.map((entry) => {
+      if (entry.checkpointId !== firstCheckpoint.checkpointId) {
+        return entry;
+      }
+
+      return {
+        ...entry,
+        previousShadowCommitSha: baselineSha,
+        parentCheckpointId: null
+      };
+    });
+
+    const serialized = updatedMetadata.map((entry) => JSON.stringify(entry)).join("\n");
+    await writeFile(this.metadataFile, serialized.length > 0 ? `${serialized}\n` : "", "utf8");
+
+    return {
+      branch,
+      shadowRef,
+      baselineSha,
+      updatedCheckpointId: firstCheckpoint.checkpointId
+    };
   }
 }

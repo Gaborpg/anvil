@@ -6,7 +6,10 @@ const EXACT_IGNORED_PATHS = new Set([
   ".anvilignore",
   ".github/hooks/anvil-copilot.json",
   ".codex/hooks.json",
-  ".codex/anvil-codex-after-edit.mjs"
+  ".codex/anvil-codex-after-edit.mjs",
+  ".anvil/policy.yaml",
+  ".anvil/extensions.yaml",
+  ".anvil/anvil-execution-guard.mjs"
 ]);
 
 const IGNORED_BASENAMES = new Set([
