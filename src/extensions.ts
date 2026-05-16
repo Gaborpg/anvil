@@ -10,8 +10,23 @@ export interface RegisteredExtension {
   description?: string;
 }
 
+export interface VerificationProfile {
+  id: string;
+  command: string;
+  autoRun: boolean;
+  description?: string;
+  includePaths: string[];
+  excludePaths: string[];
+  minChangedFiles?: number;
+  cooldownMinutes?: number;
+}
+
 export interface ExtensionsConfig {
   extensions: RegisteredExtension[];
+  verifications: {
+    enabled: boolean;
+    profiles: VerificationProfile[];
+  };
 }
 
 export interface ExtensionCheckpointPayload {
@@ -39,6 +54,7 @@ export interface EnsureExtensionsTemplateResult {
 const EXTENSIONS_FILE_NAME = "extensions.yaml";
 const GENERATED_INSIGHTS_FILE_NAME = "generated-insights.jsonl";
 const PENDING_EXTENSION_EVENTS_FILE_NAME = "pending-extension-events.jsonl";
+const VERIFICATION_LOGS_DIR_NAME = "verification-logs";
 
 export function extensionsConfigPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, ".anvil", EXTENSIONS_FILE_NAME);
@@ -50,6 +66,10 @@ export function generatedInsightsPath(repositoryRoot: string): string {
 
 export function pendingExtensionEventsPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, ".anvil", PENDING_EXTENSION_EVENTS_FILE_NAME);
+}
+
+export function verificationLogsRoot(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", VERIFICATION_LOGS_DIR_NAME);
 }
 
 export async function ensureExtensionsTemplate(
@@ -68,6 +88,19 @@ extensions:
     enabled: false
     command: node .anvil/apps/review-hints.mjs
     description: "Generate structured checkpoint review hints"
+
+verifications:
+  enabled: false
+  profiles:
+    build:
+      command: npm run build
+      autoRun: false
+    test:
+      command: npm test -- --watch=false
+      autoRun: false
+    lint:
+      command: npm run lint
+      autoRun: false
 `;
   await writeFile(filePath, content, "utf8");
   return { filePath, created: true };
@@ -83,16 +116,33 @@ function parseBoolean(value: string): boolean | null {
   return null;
 }
 
+function parseNumber(value: string): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export async function loadExtensionsConfig(repositoryRoot: string): Promise<ExtensionsConfig> {
   const filePath = extensionsConfigPath(repositoryRoot);
   if (!existsSync(filePath)) {
-    return { extensions: [] };
+    return {
+      extensions: [],
+      verifications: {
+        enabled: false,
+        profiles: []
+      }
+    };
   }
 
   const content = await readFile(filePath, "utf8");
   const extensions: RegisteredExtension[] = [];
+  const verificationProfiles: VerificationProfile[] = [];
   let inExtensions = false;
+  let inVerifications = false;
+  let inVerificationProfiles = false;
   let current: RegisteredExtension | null = null;
+  let currentVerification: VerificationProfile | null = null;
+  let activeVerificationArray: "includePaths" | "excludePaths" | null = null;
+  let verificationsEnabled = false;
 
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.replace(/\t/g, "  ");
@@ -103,35 +153,130 @@ export async function loadExtensionsConfig(repositoryRoot: string): Promise<Exte
 
     if (!line.startsWith(" ")) {
       inExtensions = trimmed === "extensions:";
+      inVerifications = trimmed === "verifications:";
+      inVerificationProfiles = false;
       current = null;
+      currentVerification = null;
+      activeVerificationArray = null;
       continue;
     }
 
-    if (!inExtensions) {
+    if (inExtensions) {
+      if (line.startsWith("  ") && !line.startsWith("    ")) {
+        const match = trimmed.match(/^([A-Za-z0-9_-]+):\s*$/);
+        if (!match) {
+          current = null;
+          continue;
+        }
+
+        current = {
+          id: match[1],
+          enabled: false,
+          command: ""
+        };
+        extensions.push(current);
+        continue;
+      }
+
+      if (!current) {
+        continue;
+      }
+
+      const pair = trimmed.match(/^([A-Za-z0-9_-]+):\s*(.+)?$/);
+      if (!pair) {
+        continue;
+      }
+
+      const [, key, rawValue = ""] = pair;
+      const value = rawValue.trim().replace(/^['"]|['"]$/g, "");
+      switch (key) {
+        case "enabled": {
+          const parsed = parseBoolean(value);
+          current.enabled = parsed ?? current.enabled;
+          break;
+        }
+        case "command":
+          current.command = value;
+          break;
+        case "description":
+          current.description = value;
+          break;
+      }
+      continue;
+    }
+
+    if (!inVerifications) {
       continue;
     }
 
     if (line.startsWith("  ") && !line.startsWith("    ")) {
-      const match = trimmed.match(/^([A-Za-z0-9_-]+):\s*$/);
-      if (!match) {
-        current = null;
+      currentVerification = null;
+      activeVerificationArray = null;
+
+      if (trimmed === "profiles:") {
+        inVerificationProfiles = true;
         continue;
       }
 
-      current = {
+      inVerificationProfiles = false;
+      const pair = trimmed.match(/^([A-Za-z0-9_-]+):\s*(.+)?$/);
+      if (!pair) {
+        continue;
+      }
+
+      const [, key, rawValue = ""] = pair;
+      const value = rawValue.trim().replace(/^['"]|['"]$/g, "");
+      if (key === "enabled") {
+        const parsed = parseBoolean(value);
+        verificationsEnabled = parsed ?? verificationsEnabled;
+      }
+      continue;
+    }
+
+    if (!inVerificationProfiles) {
+      continue;
+    }
+
+    if (line.startsWith("    ") && !line.startsWith("      ")) {
+      const match = trimmed.match(/^([A-Za-z0-9_-]+):\s*$/);
+      if (!match) {
+        currentVerification = null;
+        activeVerificationArray = null;
+        continue;
+      }
+
+      currentVerification = {
         id: match[1],
-        enabled: false,
-        command: ""
+        command: "",
+        autoRun: false,
+        includePaths: [],
+        excludePaths: []
       };
-      extensions.push(current);
+      verificationProfiles.push(currentVerification);
+      activeVerificationArray = null;
       continue;
     }
 
-    if (!current) {
+    if (!currentVerification) {
       continue;
     }
 
-    const pair = trimmed.match(/^([A-Za-z0-9_-]+):\s*(.+)?$/);
+    if (trimmed.startsWith("- ")) {
+      if (!activeVerificationArray) {
+        continue;
+      }
+
+      const listValue = trimmed.slice(2).trim().replace(/^['"]|['"]$/g, "");
+      if (!listValue) {
+        continue;
+      }
+
+      currentVerification[activeVerificationArray].push(listValue);
+      continue;
+    }
+
+    activeVerificationArray = null;
+    const pair = trimmed.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
     if (!pair) {
       continue;
     }
@@ -139,22 +284,53 @@ export async function loadExtensionsConfig(repositoryRoot: string): Promise<Exte
     const [, key, rawValue = ""] = pair;
     const value = rawValue.trim().replace(/^['"]|['"]$/g, "");
     switch (key) {
-      case "enabled": {
-        const parsed = parseBoolean(value);
-        current.enabled = parsed ?? current.enabled;
-        break;
-      }
       case "command":
-        current.command = value;
+        currentVerification.command = value;
         break;
       case "description":
-        current.description = value;
+        currentVerification.description = value;
         break;
+      case "autoRun": {
+        const parsed = parseBoolean(value);
+        currentVerification.autoRun = parsed ?? currentVerification.autoRun;
+        break;
+      }
+      case "minChangedFiles": {
+        const parsed = parseNumber(value);
+        if (parsed !== null && parsed >= 0) {
+          currentVerification.minChangedFiles = parsed;
+        }
+        break;
+      }
+      case "cooldownMinutes": {
+        const parsed = parseNumber(value);
+        if (parsed !== null && parsed >= 0) {
+          currentVerification.cooldownMinutes = parsed;
+        }
+        break;
+      }
+      case "includePaths":
+      case "excludePaths": {
+        activeVerificationArray = key as "includePaths" | "excludePaths";
+        if (value) {
+          const inlineValues = value
+            .replace(/^\[|\]$/g, "")
+            .split(",")
+            .map((item) => item.trim().replace(/^['"]|['"]$/g, ""))
+            .filter(Boolean);
+          currentVerification[activeVerificationArray].push(...inlineValues);
+        }
+        break;
+      }
     }
   }
 
   return {
-    extensions: extensions.filter((extension) => extension.command.trim().length > 0)
+    extensions: extensions.filter((extension) => extension.command.trim().length > 0),
+    verifications: {
+      enabled: verificationsEnabled,
+      profiles: verificationProfiles.filter((profile) => profile.command.trim().length > 0)
+    }
   };
 }
 
@@ -232,4 +408,22 @@ export async function readGeneratedInsights(
     .filter(Boolean)
     .map((line) => JSON.parse(line) as GeneratedInsightRecord)
     .filter((item) => !checkpointId || item.checkpointId === checkpointId);
+}
+
+function safeVerificationFileSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]+/g, "-");
+}
+
+export async function writeVerificationLog(
+  repositoryRoot: string,
+  checkpointId: string,
+  profileId: string,
+  content: string
+): Promise<string> {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const directory = path.join(verificationLogsRoot(repositoryRoot), checkpointId);
+  await mkdir(directory, { recursive: true });
+  const filePath = path.join(directory, `${safeVerificationFileSegment(profileId)}-${timestamp}.log`);
+  await writeFile(filePath, content, "utf8");
+  return filePath;
 }

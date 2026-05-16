@@ -47,8 +47,10 @@ import {
   consumePendingExtensionEvents,
   ensureExtensionsTemplate,
   loadExtensionsConfig,
+  writeVerificationLog,
   type ExtensionCheckpointPayload,
-  type ExtensionRunnerOutput
+  type ExtensionRunnerOutput,
+  type VerificationProfile
 } from "./extensions.js";
 import {
   collectIgnoredAnvilPaths,
@@ -95,6 +97,8 @@ Usage:
   anvil hook status
   anvil hook doctor
   anvil watch [--interval-ms 1500] [--debounce-ms 2000] [--summary "Watcher file changes"] [--kind after_edit_batch] [--origin ai|manual] [--ai-source watcher] [--command "watcher"] [--test-status passed|failed|unknown]
+  anvil verify <profile> [--checkpoint cp-1]
+  anvil verify --command "npm run build" [--name custom] [--checkpoint cp-1]
   anvil review [--port 4312]
   anvil timeline
   anvil checkpoint --summary "summary" [--kind after_edit_batch] [--command "npm test"] [--prompt "..."] [--rationale "..."] [--origin ai|manual] [--ai-source codex|copilot|manual-ai] [--test-status passed|failed|unknown] [--only path/a,path/b]
@@ -309,8 +313,70 @@ async function runCommandWithInput(command: string, cwd: string, input: string):
   });
 }
 
+async function runBufferedShellCommand(
+  command: string,
+  cwd: string
+): Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number }> {
+  const startedAt = Date.now();
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.platform === "win32" ? "cmd.exe" : "/bin/sh",
+      process.platform === "win32" ? ["/d", "/s", "/c", command] : ["-lc", command],
+      {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true
+      }
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      resolve({
+        exitCode: code ?? 1,
+        stdout,
+        stderr,
+        durationMs: Date.now() - startedAt
+      });
+    });
+  });
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function findVerificationProfile(
+  profiles: VerificationProfile[],
+  profileId: string | null
+): VerificationProfile | null {
+  if (!profileId) {
+    return null;
+  }
+
+  return profiles.find((profile) => profile.id === profileId) ?? null;
+}
+
+function summarizeVerificationResult(exitCode: number, stdout: string, stderr: string): string {
+  if (exitCode === 0) {
+    return "Command completed successfully.";
+  }
+
+  const combined = `${stderr}\n${stdout}`
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  return combined[0] ?? `Command failed with exit code ${exitCode}.`;
 }
 
 async function dirtyWorkspaceSignature(repositoryRoot: string, files: string[]): Promise<string> {
@@ -1290,6 +1356,81 @@ async function main(): Promise<void> {
       process.off("SIGINT", stopWatching);
       process.off("SIGTERM", stopWatching);
       console.log("Watcher stopped.");
+      return;
+    }
+
+    case "verify": {
+      await store.init();
+      const config = await loadExtensionsConfig(repositoryRoot);
+      const profileId = args[0] && !args[0].startsWith("-") ? args[0] : optionValue(args, "--name");
+      const profile = findVerificationProfile(config.verifications.profiles, profileId ?? null);
+      const commandValue = optionValue(args, "--command") ?? profile?.command ?? null;
+      const verificationName = optionValue(args, "--name") ?? profile?.id ?? profileId ?? "custom";
+      const checkpointId = optionValue(args, "--checkpoint");
+
+      if (!commandValue) {
+        throw new Error("verify requires a configured profile name or --command \"...\"");
+      }
+
+      const checkpoint =
+        checkpointId
+          ? await store.findCheckpoint(checkpointId)
+          : (await store.timeline()).checkpoints.at(-1) ?? null;
+
+      if (!checkpoint) {
+        throw new Error(
+          checkpointId
+            ? `Unknown checkpoint: ${checkpointId}`
+            : "No checkpoint exists on the current branch yet. Record or restore a checkpoint first."
+        );
+      }
+
+      const result = await runBufferedShellCommand(commandValue, repositoryRoot);
+      const status = result.exitCode === 0 ? "passed" : "failed";
+      const summary = summarizeVerificationResult(result.exitCode, result.stdout, result.stderr);
+      const logContent = [
+        `profile: ${verificationName}`,
+        `checkpoint: ${checkpoint.checkpointId}`,
+        `command: ${commandValue}`,
+        `status: ${status}`,
+        `exitCode: ${result.exitCode}`,
+        `durationMs: ${result.durationMs}`,
+        "",
+        "--- stdout ---",
+        result.stdout.trimEnd(),
+        "",
+        "--- stderr ---",
+        result.stderr.trimEnd(),
+        ""
+      ].join("\n");
+      const logFilePath = await writeVerificationLog(repositoryRoot, checkpoint.checkpointId, verificationName, logContent);
+
+      await appendGeneratedInsights(repositoryRoot, [
+        {
+          checkpointId: checkpoint.checkpointId,
+          extensionId: `verification:${verificationName}`,
+          insightType: "verification",
+          title: `${verificationName}: ${status}`,
+          body: summary,
+          createdAt: new Date().toISOString(),
+          source: "builtin",
+          metadata: {
+            profile: verificationName,
+            command: commandValue,
+            status,
+            exitCode: result.exitCode,
+            durationMs: result.durationMs,
+            logFilePath
+          }
+        }
+      ]);
+
+      console.log(`Verification ${verificationName}: ${status}`);
+      console.log(`Checkpoint: ${checkpoint.checkpointId}`);
+      console.log(`Command: ${commandValue}`);
+      console.log(`Duration: ${result.durationMs}ms`);
+      console.log(`Summary: ${summary}`);
+      console.log(`Log: ${logFilePath}`);
       return;
     }
 

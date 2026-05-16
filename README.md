@@ -489,6 +489,54 @@ Important:
 - if multiple files are already dirty, they will be grouped into the same watcher checkpoint
 - stop it with `Ctrl+C`
 
+## Verification
+
+Anvil can also run named verification commands against the latest checkpoint on the current branch.
+
+Examples:
+
+```bash
+anvil verify build
+anvil verify test
+anvil verify lint
+anvil verify --command "npm run build" --name build
+```
+
+What it does:
+- resolves the named profile from `.anvil/extensions.yaml`
+- runs the command in the repo
+- attaches the result to the latest checkpoint as derived verification data
+- writes the full stdout/stderr log under `.anvil/verification-logs`
+
+Verification config lives in:
+
+```text
+.anvil/extensions.yaml
+```
+
+Example:
+
+```yaml
+verifications:
+  enabled: false
+  profiles:
+    build:
+      command: npm run build
+      autoRun: false
+    test:
+      command: npm test -- --watch=false
+      autoRun: false
+    lint:
+      command: npm run lint
+      autoRun: false
+```
+
+Current behavior:
+- manual `anvil verify ...` is implemented
+- full logs are stored as separate files under `.anvil/verification-logs/<checkpointId>/`
+- verification results are stored as derived records, not as new checkpoints
+- auto-run policy fields are reserved for the next step
+
 ## Execution Safety Guard
 
 Anvil can also install a repo-local pre-execution safety layer for AI-triggered tool calls.

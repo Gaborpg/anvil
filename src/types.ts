@@ -110,4 +110,5 @@ export interface GeneratedInsightRecord {
   files?: string[];
   createdAt: string;
   source: "extension" | "builtin";
+  metadata?: Record<string, unknown>;
 }
