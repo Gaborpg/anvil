@@ -728,6 +728,7 @@ export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<
   const hookPath = vscodeCopilotHookConfigPath(repositoryRoot);
   const guardScript = await ensureExecutionGuardScript(repositoryRoot);
   const nodeExecutable = currentNodeExecutable();
+  const guardScriptCommandPath = path.resolve(guardScript).replace(/\\/g, "/");
   await mkdir(path.dirname(hookPath), { recursive: true });
   const content = JSON.stringify(
     {
@@ -735,7 +736,7 @@ export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<
         PreToolUse: [
           {
             type: "command",
-            command: `"${nodeExecutable}" "${path.relative(repositoryRoot, guardScript).replace(/\\/g, "/")}" --host copilot`,
+            command: `"${nodeExecutable}" "${guardScriptCommandPath}" --host copilot`,
             timeout: 10
           }
         ],
@@ -797,6 +798,8 @@ export async function installCodexHook(repositoryRoot: string): Promise<string> 
   const guardScript = await ensureExecutionGuardScript(repositoryRoot);
   const cliEntrypoint = currentCliEntrypoint();
   const nodeExecutable = currentNodeExecutable();
+  const guardScriptCommandPath = path.resolve(guardScript).replace(/\\/g, "/");
+  const wrapperCommandPath = path.resolve(wrapperPath).replace(/\\/g, "/");
   await mkdir(path.dirname(hookPath), { recursive: true });
   const wrapperContent = `import { spawnSync } from "node:child_process";
 
@@ -1016,7 +1019,7 @@ runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
             hooks: [
               {
                 type: "command",
-                command: `"${nodeExecutable}" "${path.relative(repositoryRoot, guardScript).replace(/\\/g, "/")}" --host codex`,
+                command: `"${nodeExecutable}" "${guardScriptCommandPath}" --host codex`,
                 timeout: 10,
                 statusMessage: "Checking Anvil execution policy"
               }
@@ -1029,7 +1032,7 @@ runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
             hooks: [
               {
                 type: "command",
-                command: `node .codex/${CODEX_WRAPPER_FILE_NAME}`,
+                command: `"${nodeExecutable}" "${wrapperCommandPath}"`,
                 timeout: 30,
                 statusMessage: "Checkpointing Codex edit in Anvil"
               }
