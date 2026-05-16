@@ -71,7 +71,9 @@ export interface HookExecutionLogEntry {
     | "codex-prompt-submit"
     | "copilot-prompt-submit"
     | "copilot-pre-tool-use"
-    | "codex-pre-tool-use";
+    | "codex-pre-tool-use"
+    | "codex-permission-request"
+    | "codex-hook-parse";
   status:
     | "invalid_payload"
     | "ignored"
@@ -1125,39 +1127,35 @@ runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
       hooks: {
         PreToolUse: [
           {
-            hooks: [
-              {
-                type: "command",
-                command: `"${nodeExecutable}" "${guardScriptCommandPath}" --host codex`,
-                timeout: 10,
-                statusMessage: "Checking Anvil execution policy"
-              }
-            ]
+            type: "command",
+            command: `"${nodeExecutable}" "${guardScriptCommandPath}" --host codex`,
+            timeout: 10,
+            statusMessage: "Checking Anvil execution policy"
+          }
+        ],
+        PermissionRequest: [
+          {
+            type: "command",
+            command: `"${nodeExecutable}" "${guardScriptCommandPath}" --host codex`,
+            timeout: 10,
+            statusMessage: "Checking Anvil approval policy"
           }
         ],
         PostToolUse: [
           {
             matcher: "^apply_patch$|^Edit$|^Write$",
-            hooks: [
-              {
-                type: "command",
-                command: `"${nodeExecutable}" "${wrapperCommandPath}"`,
-                timeout: 30,
-                statusMessage: "Checkpointing Codex edit in Anvil"
-              }
-            ]
+            type: "command",
+            command: `"${nodeExecutable}" "${wrapperCommandPath}"`,
+            timeout: 30,
+            statusMessage: "Checkpointing Codex edit in Anvil"
           }
         ],
         UserPromptSubmit: [
           {
-            hooks: [
-              {
-                type: "command",
-                command: `"${nodeExecutable}" "${promptWrapperCommandPath}"`,
-                timeout: 15,
-                statusMessage: "Capturing Codex prompt for Anvil"
-              }
-            ]
+            type: "command",
+            command: `"${nodeExecutable}" "${promptWrapperCommandPath}"`,
+            timeout: 15,
+            statusMessage: "Capturing Codex prompt for Anvil"
           }
         ]
       }

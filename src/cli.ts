@@ -234,6 +234,23 @@ function emitCodexGuardDecision(
   );
 }
 
+function emitCodexPermissionRequestDecision(decision: "allow" | "deny", message?: string): void {
+  console.log(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision:
+          decision === "allow"
+            ? { behavior: "allow" }
+            : {
+                behavior: "deny",
+                ...(message ? { message } : {})
+              }
+      }
+    })
+  );
+}
+
 async function runStreamingCommand(command: string, args: string[], cwd: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
@@ -464,6 +481,12 @@ async function printHookStatus(
   console.log(`  ${formatStatusLine("copilot.autoCheckpoint", String(config.copilot?.autoCheckpoint ?? false))}`);
   console.log(`  ${formatStatusLine("codex.autoCheckpoint", String(config.codex?.autoCheckpoint ?? false))}`);
   console.log(`  ${formatStatusLine("executionGuard.enabled", String(policy.enabled))}`);
+  console.log(
+    `  ${formatStatusLine(
+      "executionGuard.enforcementMode",
+      policy.askAsDeny ? "strict (ask rules enforced as deny)" : "host-ask"
+    )}`
+  );
   console.log("");
   console.log("Installed hook files");
   console.log(`  ${formatStatusLine(".github/hooks/anvil-copilot.json", existsSync(copilotHookFile) ? "present" : "missing")}`);
@@ -646,16 +669,22 @@ async function main(): Promise<void> {
         } catch {
           await appendHookExecutionLog(repositoryRoot, {
             timestamp: new Date().toISOString(),
-            hookName: "codex-pre-tool-use",
+            hookName: "codex-hook-parse",
             status: "invalid_payload",
             mode: hookMode,
             message: "Could not parse Codex PreToolUse payload."
           });
-          emitCodexGuardDecision("deny", "Anvil execution guard could not parse the tool payload.");
+          const isPermissionRequestPayload = stdInText.includes("\"hook_event_name\":\"PermissionRequest\"");
+          if (isPermissionRequestPayload) {
+            emitCodexPermissionRequestDecision("deny", "Anvil execution guard could not parse the tool payload.");
+          } else {
+            emitCodexGuardDecision("deny", "Anvil execution guard could not parse the tool payload.");
+          }
           return;
         }
       }
 
+      const isCodexPermissionRequest = codexHookMode && codexHookInput?.hook_event_name === "PermissionRequest";
       const toolName = vscodeHookInput?.tool_name ?? codexHookInput?.tool_name ?? "unknown";
       const commandText = vscodeHookMode
         ? extractVSCodeGuardCommand(vscodeHookInput)
@@ -673,7 +702,11 @@ async function main(): Promise<void> {
         commandText,
         filePaths
       });
-      const hookName = vscodeHookMode ? "copilot-pre-tool-use" : "codex-pre-tool-use";
+      const hookName = vscodeHookMode
+        ? "copilot-pre-tool-use"
+        : isCodexPermissionRequest
+          ? "codex-permission-request"
+          : "codex-pre-tool-use";
       await appendHookExecutionLog(repositoryRoot, {
         timestamp: new Date().toISOString(),
         hookName,
@@ -691,7 +724,10 @@ async function main(): Promise<void> {
 
       const explanation = `${evaluation.category}: ${evaluation.reason}`;
       const additionalContext = `${evaluation.reason} ${evaluation.nextStep}`.trim();
-      const externalDecision = evaluation.decision === "ask" ? "deny" : evaluation.decision;
+      const externalDecision =
+        evaluation.decision === "ask" && policy.askAsDeny
+          ? "deny"
+          : evaluation.decision;
 
       if (vscodeHookMode) {
         emitVSCodeGuardDecision(externalDecision, explanation, additionalContext);
@@ -699,6 +735,19 @@ async function main(): Promise<void> {
       }
 
       if (codexHookMode) {
+        if (isCodexPermissionRequest) {
+          if (evaluation.decision === "deny") {
+            emitCodexPermissionRequestDecision("deny", evaluation.reason);
+          } else if (evaluation.decision === "allow") {
+            emitCodexPermissionRequestDecision("allow");
+          }
+          return;
+        }
+
+        if (evaluation.decision === "ask" && !policy.askAsDeny) {
+          return;
+        }
+
         emitCodexGuardDecision(externalDecision, explanation, additionalContext);
         return;
       }

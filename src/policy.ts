@@ -7,6 +7,7 @@ export type ExecutionGuardDecision = "allow" | "ask" | "deny";
 
 export interface ExecutionGuardPolicy {
   enabled: boolean;
+  askAsDeny: boolean;
   allowedTestCommands: string[];
   allowedBuildCommands: string[];
   askCommands: string[];
@@ -56,6 +57,7 @@ const EXECUTION_GUARD_WRAPPER_FILE_NAME = "anvil-execution-guard.mjs";
 
 const DEFAULT_POLICY: ExecutionGuardPolicy = {
   enabled: false,
+  askAsDeny: true,
   allowedTestCommands: [
     "npm test",
     "npm run test",
@@ -185,6 +187,8 @@ function parseNumber(value: string): number | null {
 function policyScalarKeys(): Record<string, keyof ExecutionGuardPolicy> {
   return {
     enabled: "enabled",
+    askAsDeny: "askAsDeny",
+    ask_as_deny: "askAsDeny",
     maxFilesBeforeAsk: "maxFilesBeforeAsk",
     max_files_before_ask: "maxFilesBeforeAsk"
   };
@@ -272,6 +276,11 @@ function parsePolicyYaml(content: string): ExecutionGuardPolicy {
         if (parsed !== null) {
           result.enabled = parsed;
         }
+      } else if (scalarTarget === "askAsDeny") {
+        const parsed = parseBoolean(normalizedValue);
+        if (parsed !== null) {
+          result.askAsDeny = parsed;
+        }
       } else if (scalarTarget === "maxFilesBeforeAsk") {
         const parsed = parseNumber(normalizedValue);
         if (parsed !== null && parsed >= 1) {
@@ -343,6 +352,7 @@ export async function ensurePolicyTemplate(repositoryRoot: string): Promise<Ensu
 # Keep this disabled until you are ready to gate AI-triggered tool execution.
 executionGuard:
   enabled: false
+  askAsDeny: true
   maxFilesBeforeAsk: ${DEFAULT_POLICY.maxFilesBeforeAsk}
 
   # Common test commands Anvil should allow by default.

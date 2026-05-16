@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "\"C:\\Program Files\\nodejs\\node.exe\" \"C:/Users/Gabor/Documents/New project 4/.anvil/anvil-execution-guard.mjs\" --host codex",
+        "timeout": 10,
+        "statusMessage": "Checking Anvil execution policy"
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "type": "command",
+        "command": "\"C:\\Program Files\\nodejs\\node.exe\" \"C:/Users/Gabor/Documents/New project 4/.anvil/anvil-execution-guard.mjs\" --host codex",
+        "timeout": 10,
+        "statusMessage": "Checking Anvil approval policy"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^apply_patch$|^Edit$|^Write$",
+        "type": "command",
+        "command": "\"C:\\Program Files\\nodejs\\node.exe\" \"C:/Users/Gabor/Documents/New project 4/.codex/anvil-codex-after-edit.mjs\"",
+        "timeout": 30,
+        "statusMessage": "Checkpointing Codex edit in Anvil"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "\"C:\\Program Files\\nodejs\\node.exe\" \"C:/Users/Gabor/Documents/New project 4/.anvil/anvil-codex-prompt-submit.mjs\"",
+        "timeout": 15,
+        "statusMessage": "Capturing Codex prompt for Anvil"
+      }
+    ]
+  }
+}
