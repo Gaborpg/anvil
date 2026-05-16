@@ -727,6 +727,7 @@ export function extractVSCodeHookRationale(input: VSCodeHookInput | null): strin
 export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<string> {
   const hookPath = vscodeCopilotHookConfigPath(repositoryRoot);
   const guardScript = await ensureExecutionGuardScript(repositoryRoot);
+  const nodeExecutable = currentNodeExecutable();
   await mkdir(path.dirname(hookPath), { recursive: true });
   const content = JSON.stringify(
     {
@@ -734,7 +735,7 @@ export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<
         PreToolUse: [
           {
             type: "command",
-            command: `node ${path.relative(repositoryRoot, guardScript).replace(/\\/g, "/")} --host copilot`,
+            command: `"${nodeExecutable}" "${path.relative(repositoryRoot, guardScript).replace(/\\/g, "/")}" --host copilot`,
             timeout: 10
           }
         ],
@@ -1015,7 +1016,7 @@ runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
             hooks: [
               {
                 type: "command",
-                command: `node ${path.relative(repositoryRoot, guardScript).replace(/\\/g, "/")} --host codex`,
+                command: `"${nodeExecutable}" "${path.relative(repositoryRoot, guardScript).replace(/\\/g, "/")}" --host codex`,
                 timeout: 10,
                 statusMessage: "Checking Anvil execution policy"
               }
