@@ -19,17 +19,26 @@ export interface HookConfig {
 export interface VSCodeHookInput {
   hookEventName?: string;
   tool_name?: string;
+  prompt?: unknown;
+  userPrompt?: unknown;
+  user_prompt?: unknown;
   tool_input?: {
     files?: unknown;
     filePath?: unknown;
     oldFilePath?: unknown;
     newFilePath?: unknown;
+    prompt?: unknown;
+    userPrompt?: unknown;
+    user_prompt?: unknown;
   };
 }
 
 export interface CodexHookInput {
   hook_event_name?: string;
   tool_name?: string;
+  prompt?: unknown;
+  userPrompt?: unknown;
+  user_prompt?: unknown;
   tool_input?: {
     command?: unknown;
     filePath?: unknown;
@@ -43,13 +52,19 @@ export interface CodexHookInput {
     edits?: unknown;
     writes?: unknown;
     changes?: unknown;
+    prompt?: unknown;
+    userPrompt?: unknown;
+    user_prompt?: unknown;
+    instructions?: unknown;
+    messages?: unknown;
+    input?: unknown;
   };
 }
 
 export interface HookExecutionLogEntry {
   timestamp: string;
-  hookName: "copilot-after-edit" | "codex-after-edit";
-  status: "invalid_payload" | "ignored" | "disabled" | "no_changes" | "recorded";
+  hookName: "copilot-after-edit" | "codex-after-edit" | "codex-prompt-submit" | "copilot-prompt-submit";
+  status: "invalid_payload" | "ignored" | "disabled" | "no_changes" | "recorded" | "captured";
   mode: "cli" | "vscode-hook" | "codex-hook";
   branch?: string;
   checkpointId?: string;
@@ -59,6 +74,8 @@ export interface HookExecutionLogEntry {
 
 const HOOKS_FILE_NAME = "hooks.yaml";
 const HOOK_EXECUTION_LOG_FILE_NAME = "hook-executions.jsonl";
+const COPILOT_PENDING_PROMPT_FILE_NAME = "copilot-pending-prompt.json";
+const CODEX_PENDING_PROMPT_FILE_NAME = "codex-pending-prompt.json";
 const VSCODE_HOOKS_DIR = path.join(".github", "hooks");
 const VSCODE_COPILOT_HOOK_FILE_NAME = "anvil-copilot.json";
 const CODEX_HOOKS_DIR = path.join(".codex");
@@ -85,6 +102,20 @@ export function hookConfigPath(repositoryRoot: string): string {
 
 export function hookExecutionLogPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, ".anvil", HOOK_EXECUTION_LOG_FILE_NAME);
+}
+
+export function copilotPendingPromptPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", COPILOT_PENDING_PROMPT_FILE_NAME);
+}
+
+export function codexPendingPromptPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", CODEX_PENDING_PROMPT_FILE_NAME);
+}
+
+export interface PendingCodexPrompt {
+  prompt: string;
+  rationale: string | null;
+  capturedAt: string;
 }
 
 function stripQuotes(value: string): string {
@@ -242,6 +273,100 @@ export async function readLastHookExecutionLog(
   }
 }
 
+export async function writePendingCodexPrompt(
+  repositoryRoot: string,
+  prompt: string,
+  rationale?: string | null
+): Promise<void> {
+  const filePath = codexPendingPromptPath(repositoryRoot);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const payload: PendingCodexPrompt = {
+    prompt,
+    rationale: rationale ?? null,
+    capturedAt: new Date().toISOString()
+  };
+  await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+export async function writePendingCopilotPrompt(
+  repositoryRoot: string,
+  prompt: string,
+  rationale?: string | null
+): Promise<void> {
+  const filePath = copilotPendingPromptPath(repositoryRoot);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const payload: PendingCodexPrompt = {
+    prompt,
+    rationale: rationale ?? null,
+    capturedAt: new Date().toISOString()
+  };
+  await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+export async function readPendingCodexPrompt(repositoryRoot: string): Promise<PendingCodexPrompt | null> {
+  const filePath = codexPendingPromptPath(repositoryRoot);
+  if (!existsSync(filePath)) {
+    return null;
+  }
+
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<PendingCodexPrompt>;
+    if (!parsed.prompt || typeof parsed.prompt !== "string") {
+      return null;
+    }
+
+    return {
+      prompt: parsed.prompt,
+      rationale: typeof parsed.rationale === "string" ? parsed.rationale : null,
+      capturedAt: typeof parsed.capturedAt === "string" ? parsed.capturedAt : new Date(0).toISOString()
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function readPendingCopilotPrompt(repositoryRoot: string): Promise<PendingCodexPrompt | null> {
+  const filePath = copilotPendingPromptPath(repositoryRoot);
+  if (!existsSync(filePath)) {
+    return null;
+  }
+
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<PendingCodexPrompt>;
+    if (!parsed.prompt || typeof parsed.prompt !== "string") {
+      return null;
+    }
+
+    return {
+      prompt: parsed.prompt,
+      rationale: typeof parsed.rationale === "string" ? parsed.rationale : null,
+      capturedAt: typeof parsed.capturedAt === "string" ? parsed.capturedAt : new Date(0).toISOString()
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function clearPendingCodexPrompt(repositoryRoot: string): Promise<void> {
+  const filePath = codexPendingPromptPath(repositoryRoot);
+  if (!existsSync(filePath)) {
+    return;
+  }
+
+  await writeFile(filePath, "", "utf8");
+}
+
+export async function clearPendingCopilotPrompt(repositoryRoot: string): Promise<void> {
+  const filePath = copilotPendingPromptPath(repositoryRoot);
+  if (!existsSync(filePath)) {
+    return;
+  }
+
+  await writeFile(filePath, "", "utf8");
+}
+
 export function vscodeCopilotHookConfigPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, VSCODE_HOOKS_DIR, VSCODE_COPILOT_HOOK_FILE_NAME);
 }
@@ -265,6 +390,14 @@ export function isCopilotFileEditEvent(input: VSCodeHookInput | null): boolean {
   }
 
   return Array.isArray(toolInput.files) || Boolean(toolInput.filePath || toolInput.oldFilePath || toolInput.newFilePath);
+}
+
+export function isCopilotPromptSubmitEvent(input: VSCodeHookInput | null): boolean {
+  if (!input) {
+    return false;
+  }
+
+  return input.hookEventName === "UserPromptSubmit";
 }
 
 function normalizeHookFilePath(value: unknown): string | null {
@@ -361,6 +494,94 @@ function extractNestedHookPaths(value: unknown, paths: Set<string>): void {
   }
 }
 
+function normalizePromptValue(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function extractPromptFromMessageArray(value: unknown): string | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  const parts: string[] = [];
+
+  for (const item of value) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const record = item as Record<string, unknown>;
+    const role = typeof record.role === "string" ? record.role.toLowerCase() : "";
+    if (role && role !== "user" && role !== "system" && role !== "developer") {
+      continue;
+    }
+
+    const content = normalizePromptValue(record.content) ?? normalizePromptValue(record.text) ?? normalizePromptValue(record.message);
+    if (content) {
+      parts.push(role ? `${role}: ${content}` : content);
+    }
+  }
+
+  if (parts.length === 0) {
+    return null;
+  }
+
+  return parts.join("\n\n");
+}
+
+function extractPromptFromRecord(record: Record<string, unknown>, depth = 0): string | null {
+  if (depth > 3) {
+    return null;
+  }
+
+  const directKeys = [
+    "prompt",
+    "userPrompt",
+    "user_prompt",
+    "instructions",
+    "instruction",
+    "task",
+    "request",
+    "message",
+    "content",
+    "text",
+    "query"
+  ];
+
+  for (const key of directKeys) {
+    const direct = normalizePromptValue(record[key]);
+    if (direct) {
+      return direct;
+    }
+  }
+
+  const arrayKeys = ["messages", "conversation", "input"];
+  for (const key of arrayKeys) {
+    const extracted = extractPromptFromMessageArray(record[key]);
+    if (extracted) {
+      return extracted;
+    }
+  }
+
+  const nestedKeys = ["tool_input", "payload", "request", "input", "data"];
+  for (const key of nestedKeys) {
+    const nested = record[key];
+    if (nested && typeof nested === "object") {
+      const extracted = extractPromptFromRecord(nested as Record<string, unknown>, depth + 1);
+      if (extracted) {
+        return extracted;
+      }
+    }
+  }
+
+  return null;
+}
+
 export function extractCodexHookFilePaths(input: CodexHookInput | null): string[] {
   const toolInput = input?.tool_input;
   if (!toolInput) {
@@ -395,6 +616,22 @@ export function extractCodexHookFilePaths(input: CodexHookInput | null): string[
   return typeof command === "string" ? extractCodexHookFilePathsFromText(command) : [];
 }
 
+export function extractCodexHookPrompt(input: CodexHookInput | null): string | null {
+  if (!input || typeof input !== "object") {
+    return null;
+  }
+
+  return extractPromptFromRecord(input as Record<string, unknown>);
+}
+
+export function extractVSCodeHookPrompt(input: VSCodeHookInput | null): string | null {
+  if (!input || typeof input !== "object") {
+    return null;
+  }
+
+  return extractPromptFromRecord(input as Record<string, unknown>);
+}
+
 export function extractCodexHookFilePathsFromText(command: string): string[] {
   const normalizedCommand = command
     .replace(/\\r\\n/g, "\n")
@@ -427,12 +664,47 @@ export function extractCodexHookFilePathsFromText(command: string): string[] {
   return [...paths];
 }
 
+export function extractCodexHookRationale(input: CodexHookInput | null): string | null {
+  if (!input?.tool_input || typeof input.tool_input !== "object") {
+    return null;
+  }
+
+  const record = input.tool_input as Record<string, unknown>;
+  return (
+    normalizePromptValue(record.reasoning) ??
+    normalizePromptValue(record.rationale) ??
+    normalizePromptValue(record.thought) ??
+    null
+  );
+}
+
+export function extractVSCodeHookRationale(input: VSCodeHookInput | null): string | null {
+  if (!input?.tool_input || typeof input.tool_input !== "object") {
+    return null;
+  }
+
+  const record = input.tool_input as Record<string, unknown>;
+  return (
+    normalizePromptValue(record.reasoning) ??
+    normalizePromptValue(record.rationale) ??
+    normalizePromptValue(record.thought) ??
+    null
+  );
+}
+
 export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<string> {
   const hookPath = vscodeCopilotHookConfigPath(repositoryRoot);
   await mkdir(path.dirname(hookPath), { recursive: true });
   const content = JSON.stringify(
     {
       hooks: {
+        UserPromptSubmit: [
+          {
+            type: "command",
+            command: "anvil hook copilot-prompt-submit --vscode-hook",
+            timeout: 15
+          }
+        ],
         PostToolUse: [
           {
             type: "command",
@@ -468,6 +740,14 @@ export function isCodexFileEditEvent(input: CodexHookInput | null): boolean {
 
   const toolName = input.tool_name ?? "";
   return toolName === "apply_patch" || toolName === "Edit" || toolName === "Write";
+}
+
+export function isCodexPromptSubmitEvent(input: CodexHookInput | null): boolean {
+  if (!input) {
+    return false;
+  }
+
+  return input.hook_event_name === "UserPromptSubmit";
 }
 
 export async function installCodexHook(repositoryRoot: string): Promise<string> {
@@ -640,12 +920,39 @@ if (rawInput) {
   }
 }
 
+function extractPrompt(payload) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const direct = [payload.prompt, payload.userPrompt, payload.user_prompt];
+  for (const candidate of direct) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  const toolInput = payload.tool_input;
+  if (toolInput && typeof toolInput === "object") {
+    const nested = [toolInput.prompt, toolInput.userPrompt, toolInput.user_prompt, toolInput.instructions];
+    for (const candidate of nested) {
+      if (typeof candidate === "string" && candidate.trim()) {
+        return candidate.trim();
+      }
+    }
+  }
+
+  return null;
+}
+
 const editedPaths = extractCodexPaths(payload);
+const prompt = extractPrompt(payload);
 
 if (editedPaths.length > 0) {
   const normalizedPayload = {
     hook_event_name: payload?.hook_event_name ?? "PostToolUse",
     tool_name: payload?.tool_name ?? "apply_patch",
+    ...(prompt ? { prompt } : {}),
     tool_input: {
       command: editedPaths.map((filePath) => \`*** Update File: \${filePath}\`).join("\\n")
     }
@@ -669,6 +976,18 @@ runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
                 command: `node .codex/${CODEX_WRAPPER_FILE_NAME}`,
                 timeout: 30,
                 statusMessage: "Checkpointing Codex edit in Anvil"
+              }
+            ]
+          }
+        ],
+        UserPromptSubmit: [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: "anvil hook codex-prompt-submit --codex-hook",
+                timeout: 15,
+                statusMessage: "Capturing Codex prompt for Anvil"
               }
             ]
           }

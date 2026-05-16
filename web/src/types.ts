@@ -2,6 +2,8 @@ export interface TimelineItem {
   checkpointId: string;
   timestamp: string;
   kind: string;
+  origin: "ai" | "manual";
+  aiSource: string | null;
   gitBranch: string | null;
   shadowRef: string | null;
   summary: string;
@@ -16,6 +18,8 @@ export interface TimelineItem {
 export interface ExplainItem extends TimelineItem {
   parentCheckpointId: string | null;
   shadowCommitSha: string;
+  prompt: string | null;
+  rationale: string | null;
   promptHash: string | null;
   restoreSourceCheckpointId: string | null;
 }

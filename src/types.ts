@@ -11,12 +11,17 @@ export interface CheckpointMetadata {
   timestamp: string;
   kind: CheckpointKind;
   snapshotMode: "full" | "partial";
+  origin: "ai" | "manual";
+  aiSource: string | null;
   gitBranch: string | null;
   shadowRef: string | null;
   parentCheckpointId: string | null;
+  previousShadowCommitSha: string | null;
   shadowCommitSha: string;
   filesChanged: string[];
   summary: string;
+  prompt: string | null;
+  rationale: string | null;
   promptHash: string | null;
   commandsRun: string[];
   testStatus: "unknown" | "passed" | "failed";
@@ -72,7 +77,10 @@ export interface RecordCheckpointOptions {
   summary: string;
   snapshotMode?: "full" | "partial";
   filesChanged?: string[];
+  origin?: "ai" | "manual";
+  aiSource?: string | null;
   prompt?: string;
+  rationale?: string;
   commandsRun?: string[];
   testStatus?: "unknown" | "passed" | "failed";
   restoreSourceCheckpointId?: string | null;

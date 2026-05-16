@@ -7,19 +7,32 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
   appendHookExecutionLog,
+  clearPendingCopilotPrompt,
+  clearPendingCodexPrompt,
+  copilotPendingPromptPath,
   type CodexHookInput,
   codexHookConfigPath,
   ensureHookConfigTemplate,
   extractCodexHookFilePaths,
   extractCodexHookFilePathsFromText,
+  extractCodexHookPrompt,
+  extractCodexHookRationale,
   extractHookFilePaths,
+  extractVSCodeHookPrompt,
+  extractVSCodeHookRationale,
   hookConfigPath,
   installCodexHook,
   installVSCodeCopilotHook,
   isCodexFileEditEvent,
+  isCopilotPromptSubmitEvent,
+  isCodexPromptSubmitEvent,
   isCopilotFileEditEvent,
   loadHookConfig,
+  readPendingCopilotPrompt,
+  readPendingCodexPrompt,
   readLastHookExecutionLog,
+  writePendingCopilotPrompt,
+  writePendingCodexPrompt,
   vscodeCopilotHookConfigPath,
   type VSCodeHookInput
 } from "./hooks.js";
@@ -55,13 +68,14 @@ Usage:
   anvil uninstall -g
   anvil compact --mode keep-last|squash
   anvil prune [--dry-run] [--max-checkpoints-per-branch 50] [--max-hook-logs 500]
-  anvil hook copilot-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "copilot"] [--test-status passed|failed|unknown] [--vscode-hook]
-  anvil hook codex-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "codex"] [--test-status passed|failed|unknown] [--codex-hook]
+  anvil hook copilot-prompt-submit [--prompt "..."] [--rationale "..."] [--vscode-hook]
+  anvil hook copilot-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "copilot"] [--rationale "..."] [--test-status passed|failed|unknown] [--vscode-hook]
+  anvil hook codex-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "codex"] [--rationale "..."] [--test-status passed|failed|unknown] [--codex-hook]
   anvil hook status
   anvil hook doctor
   anvil review [--port 4312]
   anvil timeline
-  anvil checkpoint --summary "summary" [--kind after_edit_batch] [--command "npm test"] [--test-status passed|failed|unknown] [--only path/a,path/b]
+  anvil checkpoint --summary "summary" [--kind after_edit_batch] [--command "npm test"] [--prompt "..."] [--rationale "..."] [--origin ai|manual] [--ai-source codex|copilot|manual-ai] [--test-status passed|failed|unknown] [--only path/a,path/b]
   anvil diff [checkpoint] [checkpoint]
   anvil restore <checkpoint>
   anvil explain <checkpoint>
@@ -69,7 +83,7 @@ Usage:
   anvil export [--preview] [--message "message"]
 
 Internal:
-  anvil __record --kind <kind> --summary "summary" [--files a,b] [--command "..."] [--prompt "..."] [--test-status passed|failed|unknown]
+  anvil __record --kind <kind> --summary "summary" [--files a,b] [--command "..."] [--prompt "..."] [--rationale "..."] [--test-status passed|failed|unknown]
 `);
 }
 
@@ -417,8 +431,13 @@ async function main(): Promise<void> {
         return;
       }
       await store.init();
-      if (hookName !== "copilot-after-edit" && hookName !== "codex-after-edit") {
-        throw new Error("Unknown hook. Supported hooks: status, doctor, copilot-after-edit, codex-after-edit");
+      if (
+        hookName !== "copilot-after-edit" &&
+        hookName !== "codex-after-edit" &&
+        hookName !== "codex-prompt-submit" &&
+        hookName !== "copilot-prompt-submit"
+      ) {
+        throw new Error("Unknown hook. Supported hooks: status, doctor, copilot-after-edit, codex-after-edit, codex-prompt-submit, copilot-prompt-submit");
       }
 
       const vscodeHookMode = args.includes("--vscode-hook");
@@ -455,6 +474,115 @@ async function main(): Promise<void> {
           });
           return;
         }
+      }
+
+      if (hookName === "codex-prompt-submit") {
+        if (codexHookMode && !isCodexPromptSubmitEvent(codexHookInput)) {
+          await appendHookExecutionLog(repositoryRoot, {
+            timestamp: new Date().toISOString(),
+            hookName,
+            status: "ignored",
+            mode: hookMode,
+            message: "Hook payload was not a Codex prompt-submit event."
+          });
+          return;
+        }
+
+        const config = await loadHookConfig(repositoryRoot);
+        if (!config.codex?.autoCheckpoint) {
+          await appendHookExecutionLog(repositoryRoot, {
+            timestamp: new Date().toISOString(),
+            hookName,
+            status: "disabled",
+            mode: hookMode,
+            branch: await resolvedBranchLabel(store),
+            message: "autoCheckpoint is disabled in .anvil/hooks.yaml."
+          });
+          return;
+        }
+
+        const prompt = optionValue(args, "--prompt") ?? extractCodexHookPrompt(codexHookInput);
+        const rationale = optionValue(args, "--rationale") ?? extractCodexHookRationale(codexHookInput);
+        if (!prompt) {
+          await appendHookExecutionLog(repositoryRoot, {
+            timestamp: new Date().toISOString(),
+            hookName,
+            status: "ignored",
+            mode: hookMode,
+            branch: await resolvedBranchLabel(store),
+            message: "No prompt text was available to capture."
+          });
+          return;
+        }
+
+        await writePendingCodexPrompt(repositoryRoot, prompt, rationale);
+        await appendHookExecutionLog(repositoryRoot, {
+          timestamp: new Date().toISOString(),
+          hookName,
+          status: "captured",
+          mode: hookMode,
+          branch: await resolvedBranchLabel(store),
+          message: "Captured Codex prompt for the next Anvil checkpoint."
+        });
+        if (!codexHookMode) {
+          console.log("Captured Codex prompt for the next Anvil checkpoint.");
+        }
+        return;
+      }
+
+      if (hookName === "copilot-prompt-submit") {
+        if (vscodeHookMode && !isCopilotPromptSubmitEvent(vscodeHookInput)) {
+          await appendHookExecutionLog(repositoryRoot, {
+            timestamp: new Date().toISOString(),
+            hookName,
+            status: "ignored",
+            mode: hookMode,
+            message: "Hook payload was not a Copilot prompt-submit event."
+          });
+          emitVSCodeHookResponse();
+          return;
+        }
+
+        const config = await loadHookConfig(repositoryRoot);
+        if (!config.copilot?.autoCheckpoint) {
+          await appendHookExecutionLog(repositoryRoot, {
+            timestamp: new Date().toISOString(),
+            hookName,
+            status: "disabled",
+            mode: hookMode,
+            branch: await resolvedBranchLabel(store),
+            message: "autoCheckpoint is disabled in .anvil/hooks.yaml."
+          });
+          emitVSCodeHookResponse();
+          return;
+        }
+
+        const prompt = optionValue(args, "--prompt") ?? extractVSCodeHookPrompt(vscodeHookInput);
+        const rationale = optionValue(args, "--rationale") ?? extractVSCodeHookRationale(vscodeHookInput);
+        if (!prompt) {
+          await appendHookExecutionLog(repositoryRoot, {
+            timestamp: new Date().toISOString(),
+            hookName,
+            status: "ignored",
+            mode: hookMode,
+            branch: await resolvedBranchLabel(store),
+            message: "No prompt text was available to capture."
+          });
+          emitVSCodeHookResponse();
+          return;
+        }
+
+        await writePendingCopilotPrompt(repositoryRoot, prompt, rationale);
+        await appendHookExecutionLog(repositoryRoot, {
+          timestamp: new Date().toISOString(),
+          hookName,
+          status: "captured",
+          mode: hookMode,
+          branch: await resolvedBranchLabel(store),
+          message: "Captured Copilot prompt for the next Anvil checkpoint."
+        });
+        emitVSCodeHookResponse("Captured Copilot prompt for the next Anvil checkpoint.");
+        return;
       }
 
       if (vscodeHookMode && !isCopilotFileEditEvent(vscodeHookInput)) {
@@ -506,10 +634,22 @@ async function main(): Promise<void> {
       const kind = (optionValue(args, "--kind") ?? hookConfig.kind ?? "after_edit_batch") as CheckpointKind;
       const defaultCommand = hookName === "copilot-after-edit" ? "copilot" : "codex";
       const commandValue = optionValue(args, "--command") ?? hookConfig.command ?? defaultCommand;
+      const pendingCodexPrompt = codexHookMode ? await readPendingCodexPrompt(repositoryRoot) : null;
+      const pendingCopilotPrompt = vscodeHookMode ? await readPendingCopilotPrompt(repositoryRoot) : null;
+      const rationale = optionValue(args, "--rationale")
+        ?? (vscodeHookMode ? extractVSCodeHookRationale(vscodeHookInput) : codexHookMode ? extractCodexHookRationale(codexHookInput) : null)
+        ?? pendingCopilotPrompt?.rationale
+        ?? pendingCodexPrompt?.rationale
+        ?? undefined;
       const testStatus = (optionValue(args, "--test-status") ?? hookConfig.testStatus ?? "unknown") as
         | "unknown"
         | "passed"
         | "failed";
+      const prompt = optionValue(args, "--prompt")
+        ?? (vscodeHookMode ? extractVSCodeHookPrompt(vscodeHookInput) : codexHookMode ? extractCodexHookPrompt(codexHookInput) : null)
+        ?? pendingCopilotPrompt?.prompt
+        ?? pendingCodexPrompt?.prompt
+        ?? undefined;
       const hookFiles = vscodeHookMode
         ? extractHookFilePaths(vscodeHookInput)
         : codexHookMode
@@ -552,9 +692,20 @@ async function main(): Promise<void> {
         summary,
         snapshotMode: hookFiles.length > 0 ? "partial" : "full",
         filesChanged: files,
+        origin: "ai",
+        aiSource: hookName === "copilot-after-edit" ? "copilot" : "codex",
+        prompt,
+        rationale,
         commandsRun: commandValue ? [commandValue] : [],
         testStatus
       });
+
+      if (vscodeHookMode && (prompt || pendingCopilotPrompt?.prompt)) {
+        await clearPendingCopilotPrompt(repositoryRoot);
+      }
+      if (codexHookMode && (prompt || pendingCodexPrompt?.prompt)) {
+        await clearPendingCodexPrompt(repositoryRoot);
+      }
 
       await appendHookExecutionLog(repositoryRoot, {
         timestamp: new Date().toISOString(),
@@ -636,6 +787,9 @@ async function main(): Promise<void> {
       const kind = optionValue(args, "--kind") ?? "after_edit_batch";
       const commandValue = optionValue(args, "--command");
       const prompt = optionValue(args, "--prompt");
+      const rationale = optionValue(args, "--rationale");
+      const originValue = optionValue(args, "--origin");
+      const aiSource = optionValue(args, "--ai-source");
       const testStatus = optionValue(args, "--test-status") as "unknown" | "passed" | "failed" | null;
       const onlyPaths = parsePathList(optionValue(args, "--only"));
       const branch = await resolvedBranchLabel(store);
@@ -656,8 +810,11 @@ async function main(): Promise<void> {
         summary,
         snapshotMode: onlyPaths.length > 0 ? "partial" : "full",
         filesChanged: files,
+        origin: (originValue as "ai" | "manual" | null) ?? (prompt || rationale || aiSource ? "ai" : "manual"),
+        aiSource: aiSource ?? null,
         commandsRun: commandValue ? [commandValue] : [],
         prompt: prompt ?? undefined,
+        rationale: rationale ?? undefined,
         testStatus: testStatus ?? "unknown"
       });
 
@@ -665,6 +822,10 @@ async function main(): Promise<void> {
       printRepositoryContext(repositoryRoot, launchCwd, checkpoint.gitBranch ?? branch);
       console.log(`Shadow ref: ${checkpoint.shadowRef ?? "unknown"}`);
       console.log(`Files: ${checkpoint.filesChanged.join(", ")}`);
+      console.log(`Origin: ${checkpoint.origin}${checkpoint.aiSource ? ` (${checkpoint.aiSource})` : ""}`);
+      if (checkpoint.rationale) {
+        console.log(`Rationale: ${checkpoint.rationale}`);
+      }
       if (checkpoint.bootstrappedFromBranch) {
         console.log(`Bootstrapped from branch: ${checkpoint.bootstrappedFromBranch}`);
       }
@@ -707,6 +868,13 @@ async function main(): Promise<void> {
       console.log(`Branch: ${checkpoint.gitBranch ?? "unknown"}`);
       console.log(`Shadow ref: ${checkpoint.shadowRef ?? "unknown"}`);
       console.log(`Summary: ${checkpoint.summary}`);
+      console.log(`Origin: ${checkpoint.origin}${checkpoint.aiSource ? ` (${checkpoint.aiSource})` : ""}`);
+      if (checkpoint.rationale) {
+        console.log(`Rationale: ${checkpoint.rationale}`);
+      }
+      if (checkpoint.prompt) {
+        console.log(`Prompt: ${checkpoint.prompt}`);
+      }
       console.log(`Files: ${checkpoint.filesChanged.join(", ") || "none"}`);
       console.log(`Prompt hash: ${checkpoint.promptHash ?? "none"}`);
       console.log(`Commands: ${checkpoint.commandsRun.join(" | ") || "none"}`);
@@ -760,14 +928,20 @@ async function main(): Promise<void> {
       const files = optionValue(args, "--files");
       const commandValue = optionValue(args, "--command");
       const prompt = optionValue(args, "--prompt");
+      const rationale = optionValue(args, "--rationale");
+      const originValue = optionValue(args, "--origin");
+      const aiSource = optionValue(args, "--ai-source");
       const testStatus = optionValue(args, "--test-status") as "unknown" | "passed" | "failed" | null;
 
       const checkpoint = await store.recordCheckpoint({
         kind: kind as "after_edit_batch",
         summary,
         filesChanged: files ? files.split(",").map((item) => item.trim()).filter(Boolean) : undefined,
+        origin: (originValue as "ai" | "manual" | null) ?? (prompt || rationale || aiSource ? "ai" : "manual"),
+        aiSource: aiSource ?? null,
         commandsRun: commandValue ? [commandValue] : [],
         prompt: prompt ?? undefined,
+        rationale: rationale ?? undefined,
         testStatus: testStatus ?? "unknown"
       });
 

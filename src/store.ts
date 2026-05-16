@@ -20,8 +20,10 @@ const DEFAULT_RETENTION = {
 interface ShadowBranchContext {
   branch: string;
   shadowRef: string;
+  headSha: string | null;
   bootstrappedFromBranch: string | null;
   bootstrappedFromCheckpointId: string | null;
+  bootstrappedFromShadowCommitSha: string | null;
   bootstrappedAt: string | null;
 }
 
@@ -100,6 +102,7 @@ export class CheckpointStore {
     }
 
     await this.ensureShadowExcludes();
+    await this.ensureShadowAlternates();
 
     return config;
   }
@@ -118,6 +121,26 @@ export class CheckpointStore {
 
     const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
     await appendFile(excludePath, `${prefix}${missingLines.join("\n")}\n`, "utf8");
+  }
+
+  private async ensureShadowAlternates(): Promise<void> {
+    const objectsPathRaw = await runGit(["rev-parse", "--git-path", "objects"], this.repositoryRoot);
+    const objectsPath = path.isAbsolute(objectsPathRaw)
+      ? objectsPathRaw
+      : path.resolve(this.repositoryRoot, objectsPathRaw);
+    const alternatesPath = path.join(this.shadowGitDir, "objects", "info", "alternates");
+    const existing = existsSync(alternatesPath) ? await readFile(alternatesPath, "utf8") : "";
+    const lines = existing
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (lines.includes(objectsPath)) {
+      return;
+    }
+
+    const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+    await appendFile(alternatesPath, `${prefix}${objectsPath}\n`, "utf8");
   }
 
   private async workspaceStatusEntries(): Promise<WorkspaceStatusEntry[]> {
@@ -335,12 +358,17 @@ export class CheckpointStore {
           timestamp: parsed.timestamp ?? new Date(0).toISOString(),
           kind: parsed.kind ?? "manual",
           snapshotMode: parsed.snapshotMode ?? "partial",
+          origin: parsed.origin ?? "manual",
+          aiSource: parsed.aiSource ?? null,
           gitBranch: parsed.gitBranch ?? null,
           shadowRef: parsed.shadowRef ?? null,
           parentCheckpointId: parsed.parentCheckpointId ?? null,
+          previousShadowCommitSha: parsed.previousShadowCommitSha ?? null,
           shadowCommitSha: parsed.shadowCommitSha ?? "",
           filesChanged: parsed.filesChanged ?? [],
           summary: parsed.summary ?? "",
+          prompt: parsed.prompt ?? null,
+          rationale: parsed.rationale ?? null,
           promptHash: parsed.promptHash ?? null,
           commandsRun: parsed.commandsRun ?? [],
           testStatus: parsed.testStatus ?? "unknown",
@@ -530,26 +558,43 @@ export class CheckpointStore {
     const exists = await this.shadowRefExists(shadowRef);
 
     if (exists) {
+      const headSha = await this.shadowRefHead(shadowRef);
       await this.pointShadowHeadAt(shadowRef);
       return {
         branch,
         shadowRef,
+        headSha,
         bootstrappedFromBranch: null,
         bootstrappedFromCheckpointId: null,
+        bootstrappedFromShadowCommitSha: null,
         bootstrappedAt: null
       };
     }
 
     const sourceBranch = await this.inferBootstrapSourceBranch(branch);
     let bootstrappedFromCheckpointId: string | null = null;
+    let bootstrappedFromShadowCommitSha: string | null = null;
 
     if (sourceBranch) {
       const sourceRef = this.shadowRefForBranch(sourceBranch);
       const sourceSha = await this.shadowRefHead(sourceRef);
       if (sourceSha) {
         await runGit(["update-ref", shadowRef, sourceSha], this.repositoryRoot, this.shadowGitDir);
+        bootstrappedFromShadowCommitSha = sourceSha;
         const sourceCheckpoint = await this.latestCheckpointForBranch(sourceBranch);
         bootstrappedFromCheckpointId = sourceCheckpoint?.checkpointId ?? null;
+      }
+    }
+
+    let headSha = await this.shadowRefHead(shadowRef);
+    if (!headSha) {
+      try {
+        const headTreeSha = await runGit(["rev-parse", "HEAD^{tree}"], this.repositoryRoot);
+        const baselineSha = await this.commitTree(headTreeSha, `anvil baseline ${branch}`);
+        await runGit(["update-ref", shadowRef, baselineSha], this.repositoryRoot, this.shadowGitDir);
+        headSha = baselineSha;
+      } catch {
+        headSha = null;
       }
     }
 
@@ -558,8 +603,10 @@ export class CheckpointStore {
     return {
       branch,
       shadowRef,
+      headSha,
       bootstrappedFromBranch: sourceBranch,
       bootstrappedFromCheckpointId,
+      bootstrappedFromShadowCommitSha,
       bootstrappedAt: new Date().toISOString()
     };
   }
@@ -594,8 +641,12 @@ export class CheckpointStore {
       throw new Error("Cannot record an Anvil checkpoint without an active Git branch.");
     }
 
-    const parent = await this.latestCheckpointForBranch(gitBranch);
     const shadowContext = await this.ensureShadowBranch(gitBranch);
+    const parent =
+      (await this.latestCheckpointForBranch(gitBranch)) ??
+      (shadowContext.bootstrappedFromCheckpointId
+        ? await this.findCheckpoint(shadowContext.bootstrappedFromCheckpointId)
+        : null);
     const snapshotMode = options.snapshotMode ?? "full";
     if (snapshotMode === "partial") {
       await this.stageWorkspacePaths(options.filesChanged);
@@ -624,7 +675,9 @@ export class CheckpointStore {
     }
 
     const shadowCommitSha = await runGit(["rev-parse", "HEAD"], this.repositoryRoot, this.shadowGitDir);
-    const changesSinceParent = await this.changedPathsBetween(parent?.shadowCommitSha ?? null, shadowCommitSha);
+    const effectiveParentShadowCommitSha =
+      parent?.shadowCommitSha ?? shadowContext.headSha ?? shadowContext.bootstrappedFromShadowCommitSha ?? null;
+    const changesSinceParent = await this.changedPathsBetween(effectiveParentShadowCommitSha, shadowCommitSha);
     const filesChanged =
       options.filesChanged && options.filesChanged.length > 0
         ? [...new Set(filterIgnoredAnvilPaths(options.filesChanged, await this.ignoreRules()))]
@@ -635,12 +688,17 @@ export class CheckpointStore {
       timestamp: new Date().toISOString(),
       kind: options.kind,
       snapshotMode,
+      origin: options.origin ?? (options.prompt || options.rationale || options.aiSource ? "ai" : "manual"),
+      aiSource: options.aiSource ?? null,
       gitBranch,
       shadowRef: shadowContext.shadowRef,
       parentCheckpointId: parent?.checkpointId ?? null,
+      previousShadowCommitSha: effectiveParentShadowCommitSha,
       shadowCommitSha,
       filesChanged,
       summary: options.summary,
+      prompt: options.prompt ?? null,
+      rationale: options.rationale ?? null,
       promptHash: hashText(options.prompt),
       commandsRun: options.commandsRun ?? [],
       testStatus: options.testStatus ?? "unknown",
@@ -670,7 +728,7 @@ export class CheckpointStore {
       }
 
       const index = checkpoints.findIndex((entry) => entry.checkpointId === fromId);
-      fromSha = index > 0 ? checkpoints[index - 1].shadowCommitSha : null;
+      fromSha = index > 0 ? checkpoints[index - 1].shadowCommitSha : target.previousShadowCommitSha;
       toSha = target.shadowCommitSha;
     } else {
       const to = toId ? checkpoints.find((entry) => entry.checkpointId === toId) : checkpoints.at(-1);
@@ -717,7 +775,7 @@ export class CheckpointStore {
 
     const parentSha = checkpoint.parentCheckpointId
       ? (await this.findCheckpoint(checkpoint.parentCheckpointId))?.shadowCommitSha ?? null
-      : null;
+      : checkpoint.previousShadowCommitSha;
 
     return {
       checkpointId,
@@ -756,7 +814,7 @@ export class CheckpointStore {
     } else {
       const parentSha = checkpoint.parentCheckpointId
         ? (await this.findCheckpoint(checkpoint.parentCheckpointId))?.shadowCommitSha ?? null
-        : null;
+        : checkpoint.previousShadowCommitSha;
       const changedPaths = await this.changedPathsBetween(parentSha, checkpoint.shadowCommitSha);
 
       if (changedPaths.checkout.length > 0) {
@@ -869,6 +927,7 @@ export class CheckpointStore {
     const retainedEntry: CheckpointMetadata = {
       ...latest,
       parentCheckpointId: null,
+      previousShadowCommitSha: latest.previousShadowCommitSha,
       shadowCommitSha: targetSha,
       summary,
       bootstrappedFromBranch: null,
@@ -938,6 +997,7 @@ export class CheckpointStore {
       const rebuiltCheckpoint: CheckpointMetadata = {
         ...checkpoint,
         parentCheckpointId: rebuilt.at(-1)?.checkpointId ?? null,
+        previousShadowCommitSha: index === 0 ? checkpoint.previousShadowCommitSha : parentSha,
         shadowCommitSha: rebuiltSha,
         shadowRef,
         bootstrappedFromBranch: index === 0 ? checkpoint.bootstrappedFromBranch : null,
