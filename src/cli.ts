@@ -2,7 +2,9 @@
 import process from "node:process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
@@ -92,6 +94,7 @@ Usage:
   anvil hook codex-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "codex"] [--rationale "..."] [--test-status passed|failed|unknown] [--codex-hook]
   anvil hook status
   anvil hook doctor
+  anvil watch [--interval-ms 1500] [--debounce-ms 2000] [--summary "Watcher file changes"] [--kind after_edit_batch] [--origin ai|manual] [--ai-source watcher] [--command "watcher"] [--test-status passed|failed|unknown]
   anvil review [--port 4312]
   anvil timeline
   anvil checkpoint --summary "summary" [--kind after_edit_batch] [--command "npm test"] [--prompt "..."] [--rationale "..."] [--origin ai|manual] [--ai-source codex|copilot|manual-ai] [--test-status passed|failed|unknown] [--only path/a,path/b]
@@ -304,6 +307,37 @@ async function runCommandWithInput(command: string, cwd: string, input: string):
     child.stdin.write(input);
     child.stdin.end();
   });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function dirtyWorkspaceSignature(repositoryRoot: string, files: string[]): Promise<string> {
+  const hash = createHash("sha256");
+
+  for (const filePath of [...files].sort()) {
+    hash.update(filePath);
+    hash.update("\0");
+
+    const absolutePath = path.join(repositoryRoot, filePath);
+    if (!existsSync(absolutePath)) {
+      hash.update("<missing>");
+      hash.update("\0");
+      continue;
+    }
+
+    try {
+      const content = await readFile(absolutePath);
+      hash.update(content);
+    } catch {
+      hash.update("<unreadable>");
+    }
+
+    hash.update("\0");
+  }
+
+  return hash.digest("hex");
 }
 
 function launchExtensionProcessor(repositoryRoot: string): void {
@@ -1155,6 +1189,107 @@ async function main(): Promise<void> {
       child.on("exit", (code) => {
         process.exitCode = code ?? 0;
       });
+      return;
+    }
+
+    case "watch": {
+      await store.init();
+      const intervalMs = Number(optionValue(args, "--interval-ms") ?? "1500");
+      const debounceMs = Number(optionValue(args, "--debounce-ms") ?? "2000");
+      const summary = optionValue(args, "--summary") ?? "Watcher file changes";
+      const kind = (optionValue(args, "--kind") ?? "after_edit_batch") as CheckpointKind;
+      const commandValue = optionValue(args, "--command") ?? "watcher";
+      const originValue = optionValue(args, "--origin");
+      const aiSource = optionValue(args, "--ai-source");
+      const testStatus = (optionValue(args, "--test-status") ?? "unknown") as "unknown" | "passed" | "failed";
+
+      if (!Number.isFinite(intervalMs) || intervalMs < 250) {
+        throw new Error("watch requires --interval-ms to be at least 250");
+      }
+
+      if (!Number.isFinite(debounceMs) || debounceMs < 250) {
+        throw new Error("watch requires --debounce-ms to be at least 250");
+      }
+
+      let active = true;
+      let pendingSignature: string | null = null;
+      let pendingFiles: string[] = [];
+      let pendingSince = 0;
+      let lastRecordedSignature: string | null = null;
+
+      const stopWatching = (): void => {
+        active = false;
+      };
+
+      process.on("SIGINT", stopWatching);
+      process.on("SIGTERM", stopWatching);
+
+      console.log(`Watching ${repositoryRoot} for fallback Anvil checkpoints...`);
+      console.log(`Interval: ${intervalMs}ms  Debounce: ${debounceMs}ms`);
+      console.log("Press Ctrl+C to stop.");
+
+      while (active) {
+        try {
+          const files = await gitStatusFiles(repositoryRoot, ignoreRules);
+
+          if (files.length === 0) {
+            pendingSignature = null;
+            pendingFiles = [];
+            pendingSince = 0;
+            await delay(intervalMs);
+            continue;
+          }
+
+          const signature = await dirtyWorkspaceSignature(repositoryRoot, files);
+          if (signature === lastRecordedSignature) {
+            await delay(intervalMs);
+            continue;
+          }
+
+          if (signature !== pendingSignature) {
+            pendingSignature = signature;
+            pendingFiles = files;
+            pendingSince = Date.now();
+            await delay(intervalMs);
+            continue;
+          }
+
+          if (Date.now() - pendingSince < debounceMs) {
+            await delay(intervalMs);
+            continue;
+          }
+
+          const checkpoint = await store.recordCheckpoint({
+            kind,
+            summary,
+            snapshotMode: "partial",
+            filesChanged: pendingFiles,
+            origin: (originValue as "ai" | "manual" | null) ?? (aiSource ? "ai" : "manual"),
+            aiSource: aiSource ?? null,
+            commandsRun: commandValue ? [commandValue] : [],
+            testStatus
+          });
+
+          launchExtensionProcessor(repositoryRoot);
+          lastRecordedSignature = signature;
+          pendingSignature = null;
+          pendingFiles = [];
+          pendingSince = 0;
+
+          console.log(
+            `[${formatTimestamp(checkpoint.timestamp)}] Recorded ${checkpoint.checkpointId} (${checkpoint.filesChanged.join(", ")})`
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(`Watcher error: ${message}`);
+        }
+
+        await delay(intervalMs);
+      }
+
+      process.off("SIGINT", stopWatching);
+      process.off("SIGTERM", stopWatching);
+      console.log("Watcher stopped.");
       return;
     }
 

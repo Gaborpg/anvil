@@ -55,6 +55,7 @@ export interface EnsurePolicyTemplateResult {
 const POLICY_FILE_NAME = "policy.yaml";
 const EXECUTION_GUARD_WRAPPER_FILE_NAME = "anvil-execution-guard.mjs";
 
+// Defaults are intentionally stack-agnostic so the same guard can start safely in most repos.\r\n// watcher smoke marker
 const DEFAULT_POLICY: ExecutionGuardPolicy = {
   enabled: false,
   askAsDeny: true,
@@ -771,3 +772,4 @@ export function evaluateExecutionGuard(
     nextStep: "Proceed."
   };
 }
+

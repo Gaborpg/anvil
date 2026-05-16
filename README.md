@@ -465,6 +465,30 @@ This reports:
 
 This is the fastest way to debug “why didn’t the hook run?” before chasing editor-specific behavior.
 
+## Fallback Watcher
+
+If your editor or agent does not reliably fire `PostToolUse`, you can run a local fallback watcher instead:
+
+```bash
+anvil watch
+```
+
+Useful options:
+
+```bash
+anvil watch --interval-ms 1500 --debounce-ms 2000 --summary "Watcher file changes"
+```
+
+What it does:
+- polls Git-visible dirty files on an interval
+- waits for them to stay stable for the debounce window
+- records an Anvil checkpoint without relying on host hooks
+
+Important:
+- the watcher checkpoints the current dirty workspace state
+- if multiple files are already dirty, they will be grouped into the same watcher checkpoint
+- stop it with `Ctrl+C`
+
 ## Execution Safety Guard
 
 Anvil can also install a repo-local pre-execution safety layer for AI-triggered tool calls.
