@@ -91,6 +91,7 @@ export interface HookExecutionLogEntry {
 
 const HOOKS_FILE_NAME = "hooks.yaml";
 const HOOK_EXECUTION_LOG_FILE_NAME = "hook-executions.jsonl";
+const HOOK_WRAPPER_ERROR_LOG_FILE_NAME = "hook-wrapper-errors.log";
 const COPILOT_PENDING_PROMPT_FILE_NAME = "copilot-pending-prompt.json";
 const CODEX_PENDING_PROMPT_FILE_NAME = "codex-pending-prompt.json";
 const VSCODE_HOOKS_DIR = path.join(".github", "hooks");
@@ -98,6 +99,8 @@ const VSCODE_COPILOT_HOOK_FILE_NAME = "anvil-copilot.json";
 const CODEX_HOOKS_DIR = path.join(".codex");
 const CODEX_HOOKS_FILE_NAME = "hooks.json";
 const CODEX_WRAPPER_FILE_NAME = "anvil-codex-after-edit.mjs";
+const CODEX_PROMPT_WRAPPER_FILE_NAME = "anvil-codex-prompt-submit.mjs";
+const COPILOT_PROMPT_WRAPPER_FILE_NAME = "anvil-copilot-prompt-submit.mjs";
 const ANVIL_INTERNAL_HOOK_PATH = `${VSCODE_HOOKS_DIR.replace(/\\/g, "/")}/${VSCODE_COPILOT_HOOK_FILE_NAME}`;
 const ANVIL_INTERNAL_CODEX_HOOK_PATH = `${CODEX_HOOKS_DIR.replace(/\\/g, "/")}/${CODEX_HOOKS_FILE_NAME}`;
 const ANVIL_INTERNAL_CODEX_WRAPPER_PATH = `${CODEX_HOOKS_DIR.replace(/\\/g, "/")}/${CODEX_WRAPPER_FILE_NAME}`;
@@ -128,6 +131,73 @@ function shellCommandForCurrentCli(args: string[]): string {
   return `"${nodeExecutable}" "${cliEntrypoint}" ${escapedArgs.map((value) => `"${value}"`).join(" ")}`;
 }
 
+function promptWrapperContent(
+  repositoryRoot: string,
+  cliEntrypoint: string,
+  nodeExecutable: string,
+  hookName: "codex-prompt-submit" | "copilot-prompt-submit",
+  modeFlag: "--codex-hook" | "--vscode-hook"
+): string {
+  const errorLogPath = path.join(repositoryRoot, ".anvil", HOOK_WRAPPER_ERROR_LOG_FILE_NAME);
+  return `import { appendFile, mkdir } from "node:fs/promises";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+
+function readStdin() {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) {
+      resolve("");
+      return;
+    }
+
+    const chunks = [];
+    process.stdin.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+  });
+}
+
+async function logWrapperError(error) {
+  const target = ${JSON.stringify(errorLogPath)};
+  await mkdir(path.dirname(target), { recursive: true });
+  const message = error instanceof Error ? (error.stack || error.message) : String(error);
+  const record = {
+    timestamp: new Date().toISOString(),
+    wrapper: ${JSON.stringify(hookName)},
+    cwd: process.cwd(),
+    message
+  };
+  await appendFile(target, \`\${JSON.stringify(record)}\\n\`, "utf8");
+}
+
+try {
+  const rawInput = await readStdin();
+  const result = spawnSync(${JSON.stringify(nodeExecutable)}, [${JSON.stringify(cliEntrypoint)}, "hook", ${JSON.stringify(hookName)}, ${JSON.stringify(modeFlag)}], {
+    cwd: process.cwd(),
+    input: rawInput,
+    encoding: "utf8",
+    shell: false
+  });
+
+  if (result.stdout) {
+    process.stdout.write(result.stdout);
+  }
+
+  if (result.stderr) {
+    process.stderr.write(result.stderr);
+  }
+
+  if ((result.status ?? 0) !== 0) {
+    await logWrapperError(new Error(result.stderr?.trim() || result.stdout?.trim() || ${JSON.stringify(`${hookName} exited with code`)} + " " + String(result.status ?? "unknown")));
+  }
+
+  process.exit(result.status ?? 0);
+} catch (error) {
+  await logWrapperError(error);
+  process.exit(1);
+}
+`;
+}
+
 export function hookConfigPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, ".anvil", HOOKS_FILE_NAME);
 }
@@ -136,12 +206,24 @@ export function hookExecutionLogPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, ".anvil", HOOK_EXECUTION_LOG_FILE_NAME);
 }
 
+export function hookWrapperErrorLogPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", HOOK_WRAPPER_ERROR_LOG_FILE_NAME);
+}
+
 export function copilotPendingPromptPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, ".anvil", COPILOT_PENDING_PROMPT_FILE_NAME);
 }
 
 export function codexPendingPromptPath(repositoryRoot: string): string {
   return path.join(repositoryRoot, ".anvil", CODEX_PENDING_PROMPT_FILE_NAME);
+}
+
+export function codexPromptWrapperPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", CODEX_PROMPT_WRAPPER_FILE_NAME);
+}
+
+export function copilotPromptWrapperPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", COPILOT_PROMPT_WRAPPER_FILE_NAME);
 }
 
 export interface PendingCodexPrompt {
@@ -727,9 +809,23 @@ export function extractVSCodeHookRationale(input: VSCodeHookInput | null): strin
 export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<string> {
   const hookPath = vscodeCopilotHookConfigPath(repositoryRoot);
   const guardScript = await ensureExecutionGuardScript(repositoryRoot);
+  const promptWrapperPath = copilotPromptWrapperPath(repositoryRoot);
   const nodeExecutable = currentNodeExecutable();
   const guardScriptCommandPath = path.resolve(guardScript).replace(/\\/g, "/");
+  const cliEntrypoint = currentCliEntrypoint();
+  const promptWrapperCommandPath = path.resolve(promptWrapperPath).replace(/\\/g, "/");
   await mkdir(path.dirname(hookPath), { recursive: true });
+  await writeFile(
+    promptWrapperPath,
+    `${promptWrapperContent(
+      repositoryRoot,
+      cliEntrypoint,
+      nodeExecutable,
+      "copilot-prompt-submit",
+      "--vscode-hook"
+    )}\n`,
+    "utf8"
+  );
   const content = JSON.stringify(
     {
       hooks: {
@@ -743,7 +839,7 @@ export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<
         UserPromptSubmit: [
           {
             type: "command",
-            command: shellCommandForCurrentCli(["hook", "copilot-prompt-submit", "--vscode-hook"]),
+            command: `"${nodeExecutable}" "${promptWrapperCommandPath}"`,
             timeout: 15
           }
         ],
@@ -795,11 +891,13 @@ export function isCodexPromptSubmitEvent(input: CodexHookInput | null): boolean 
 export async function installCodexHook(repositoryRoot: string): Promise<string> {
   const hookPath = codexHookConfigPath(repositoryRoot);
   const wrapperPath = codexHookWrapperPath(repositoryRoot);
+  const promptWrapperPath = codexPromptWrapperPath(repositoryRoot);
   const guardScript = await ensureExecutionGuardScript(repositoryRoot);
   const cliEntrypoint = currentCliEntrypoint();
   const nodeExecutable = currentNodeExecutable();
   const guardScriptCommandPath = path.resolve(guardScript).replace(/\\/g, "/");
   const wrapperCommandPath = path.resolve(wrapperPath).replace(/\\/g, "/");
+  const promptWrapperCommandPath = path.resolve(promptWrapperPath).replace(/\\/g, "/");
   await mkdir(path.dirname(hookPath), { recursive: true });
   const wrapperContent = `import { spawnSync } from "node:child_process";
 
@@ -1011,6 +1109,17 @@ if (editedPaths.length > 0) {
 runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
 `;
   await writeFile(wrapperPath, `${wrapperContent}\n`, "utf8");
+  await writeFile(
+    promptWrapperPath,
+    `${promptWrapperContent(
+      repositoryRoot,
+      cliEntrypoint,
+      nodeExecutable,
+      "codex-prompt-submit",
+      "--codex-hook"
+    )}\n`,
+    "utf8"
+  );
   const content = JSON.stringify(
     {
       hooks: {
@@ -1044,7 +1153,7 @@ runAnvil(["hook", "codex-after-edit", "--codex-hook"], rawInput);
             hooks: [
               {
                 type: "command",
-                command: shellCommandForCurrentCli(["hook", "codex-prompt-submit", "--codex-hook"]),
+                command: `"${nodeExecutable}" "${promptWrapperCommandPath}"`,
                 timeout: 15,
                 statusMessage: "Capturing Codex prompt for Anvil"
               }

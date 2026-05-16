@@ -9,7 +9,10 @@ const EXACT_IGNORED_PATHS = new Set([
   ".codex/anvil-codex-after-edit.mjs",
   ".anvil/policy.yaml",
   ".anvil/extensions.yaml",
-  ".anvil/anvil-execution-guard.mjs"
+  ".anvil/anvil-execution-guard.mjs",
+  ".anvil/anvil-codex-prompt-submit.mjs",
+  ".anvil/anvil-copilot-prompt-submit.mjs",
+  ".anvil/hook-wrapper-errors.log"
 ]);
 
 const IGNORED_BASENAMES = new Set([

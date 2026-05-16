@@ -9,9 +9,11 @@ import {
   appendHookExecutionLog,
   clearPendingCopilotPrompt,
   clearPendingCodexPrompt,
+  copilotPromptWrapperPath,
   copilotPendingPromptPath,
   type CodexHookInput,
   codexHookConfigPath,
+  codexPromptWrapperPath,
   ensureHookConfigTemplate,
   extractCodexHookFilePaths,
   extractCodexHookFilePathsFromText,
@@ -31,6 +33,7 @@ import {
   readPendingCopilotPrompt,
   readPendingCodexPrompt,
   readLastHookExecutionLog,
+  hookWrapperErrorLogPath,
   writePendingCopilotPrompt,
   writePendingCodexPrompt,
   vscodeCopilotHookConfigPath,
@@ -418,6 +421,9 @@ async function printHookStatus(
   const policyFile = path.join(repositoryRoot, ".anvil", "policy.yaml");
   const extensionsFile = path.join(repositoryRoot, ".anvil", "extensions.yaml");
   const guardScriptFile = executionGuardScriptPath(repositoryRoot);
+  const codexPromptWrapperFile = codexPromptWrapperPath(repositoryRoot);
+  const copilotPromptWrapperFile = copilotPromptWrapperPath(repositoryRoot);
+  const hookWrapperErrorFile = hookWrapperErrorLogPath(repositoryRoot);
   const anvilIgnoreFile = path.join(repositoryRoot, ".anvilignore");
   const ignorePatternCount = ignoreRules?.patterns.length ?? 0;
   const gitStatus = await gitStatusSnapshot(repositoryRoot, ignoreRules);
@@ -435,6 +441,9 @@ async function printHookStatus(
   console.log(`  ${formatStatusLine(".anvil/policy.yaml", existsSync(policyFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine(".anvil/extensions.yaml", existsSync(extensionsFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine(".anvil/anvil-execution-guard.mjs", existsSync(guardScriptFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".anvil/anvil-codex-prompt-submit.mjs", existsSync(codexPromptWrapperFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".anvil/anvil-copilot-prompt-submit.mjs", existsSync(copilotPromptWrapperFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".anvil/hook-wrapper-errors.log", existsSync(hookWrapperErrorFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine("copilot.autoCheckpoint", String(config.copilot?.autoCheckpoint ?? false))}`);
   console.log(`  ${formatStatusLine("codex.autoCheckpoint", String(config.codex?.autoCheckpoint ?? false))}`);
   console.log(`  ${formatStatusLine("executionGuard.enabled", String(policy.enabled))}`);
