@@ -721,7 +721,7 @@ export class CheckpointStore {
     return metadata;
   }
 
-  async generatedInsights(checkpointId: string): Promise<GeneratedInsightRecord[]> {
+  async generatedInsights(checkpointId?: string): Promise<GeneratedInsightRecord[]> {
     return readGeneratedInsights(this.repositoryRoot, checkpointId);
   }
 

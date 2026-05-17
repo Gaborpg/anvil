@@ -33,6 +33,51 @@ export interface GeneratedInsightItem {
   files?: string[];
   createdAt: string;
   source: "extension" | "builtin";
+  metadata?: Record<string, unknown>;
+}
+
+export interface VerificationLogItem {
+  checkpointId: string;
+  extensionId: string;
+  title: string;
+  body: string;
+  createdAt: string;
+  profile: string;
+  command: string;
+  status: string;
+  exitCode: number | null;
+  durationMs: number | null;
+  logFilePath: string;
+}
+
+export interface VerificationLogListResponse {
+  logs: VerificationLogItem[];
+}
+
+export interface VerificationLogContentResponse {
+  logFilePath: string;
+  content: string;
+}
+
+export interface OrchestrationRunItem {
+  checkpointId: string;
+  extensionId: string;
+  title: string;
+  body: string;
+  createdAt: string;
+  actionId: string;
+  actionType: string;
+  triggerPhase: string;
+  status: string;
+  command: string;
+  durationMs: number | null;
+  logFilePath: string | null;
+  error: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface OrchestrationRunListResponse {
+  runs: OrchestrationRunItem[];
 }
 
 export interface TimelineResponse {

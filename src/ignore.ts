@@ -8,6 +8,7 @@ const EXACT_IGNORED_PATHS = new Set([
   ".codex/hooks.json",
   ".codex/anvil-codex-after-edit.mjs",
   ".anvil/policy.yaml",
+  ".anvil/orchestration.yaml",
   ".anvil/extensions.yaml",
   ".anvil/anvil-execution-guard.mjs",
   ".anvil/anvil-codex-prompt-submit.mjs",

@@ -44,11 +44,17 @@ import {
 import { getRepositoryRoot } from "./git.js";
 import {
   appendGeneratedInsights,
+  appendPendingHookOrchestrationEvent,
   consumePendingExtensionEvents,
-  ensureExtensionsTemplate,
-  loadExtensionsConfig,
+  consumePendingHookOrchestrationEvents,
+  ensureOrchestrationTemplate,
+  loadOrchestrationConfig,
+  matchesAfterCheckpointRule,
+  matchesAfterHookRule,
   writeVerificationLog,
   type ExtensionCheckpointPayload,
+  type HookOrchestrationEvent,
+  type OrchestrationAction,
   type ExtensionRunnerOutput,
   type VerificationProfile
 } from "./extensions.js";
@@ -97,6 +103,8 @@ Usage:
   anvil hook status
   anvil hook doctor
   anvil watch [--interval-ms 1500] [--debounce-ms 2000] [--summary "Watcher file changes"] [--kind after_edit_batch] [--origin ai|manual] [--ai-source watcher] [--command "watcher"] [--test-status passed|failed|unknown]
+  anvil run <profile> [--checkpoint cp-1]
+  anvil run --command "npm run build" [--name custom] [--checkpoint cp-1]
   anvil verify <profile> [--checkpoint cp-1]
   anvil verify --command "npm run build" [--name custom] [--checkpoint cp-1]
   anvil review [--port 4312]
@@ -379,6 +387,195 @@ function summarizeVerificationResult(exitCode: number, stdout: string, stderr: s
   return combined[0] ?? `Command failed with exit code ${exitCode}.`;
 }
 
+function buildCommandLogContent(
+  label: string,
+  checkpointId: string,
+  commandValue: string,
+  status: "passed" | "failed",
+  exitCode: number,
+  durationMs: number,
+  stdout: string,
+  stderr: string
+): string {
+  return [
+    `label: ${label}`,
+    `checkpoint: ${checkpointId}`,
+    `command: ${commandValue}`,
+    `status: ${status}`,
+    `exitCode: ${exitCode}`,
+    `durationMs: ${durationMs}`,
+    "",
+    "--- stdout ---",
+    stdout.trimEnd(),
+    "",
+    "--- stderr ---",
+    stderr.trimEnd(),
+    ""
+  ].join("\n");
+}
+
+async function persistVerificationResult(
+  repositoryRoot: string,
+  checkpointId: string,
+  verificationName: string,
+  commandValue: string,
+  triggerPhase: "beforeCheckpoint" | "afterHook" | "afterCheckpoint" | "manual",
+  result: { exitCode: number; stdout: string; stderr: string; durationMs: number }
+): Promise<{
+  status: "passed" | "failed";
+  summary: string;
+  durationMs: number;
+  logFilePath: string;
+  exitCode: number;
+}> {
+  const status = result.exitCode === 0 ? "passed" : "failed";
+  const summary = summarizeVerificationResult(result.exitCode, result.stdout, result.stderr);
+  const logFilePath = await writeVerificationLog(
+    repositoryRoot,
+    checkpointId,
+    verificationName,
+    buildCommandLogContent(
+      verificationName,
+      checkpointId,
+      commandValue,
+      status,
+      result.exitCode,
+      result.durationMs,
+      result.stdout,
+      result.stderr
+    )
+  );
+
+  await appendGeneratedInsights(repositoryRoot, [
+    {
+      checkpointId,
+      extensionId: `profile:${verificationName}`,
+      insightType: "profile-run",
+      title: `${verificationName}: ${status}`,
+      body: summary,
+      createdAt: new Date().toISOString(),
+      source: "builtin",
+      metadata: {
+        profile: verificationName,
+        command: commandValue,
+        status,
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+        logFilePath
+      }
+    }
+  ]);
+
+  await appendOrchestrationRunRecord(repositoryRoot, checkpointId, {
+    actionId: verificationName,
+    actionType: "runProfile",
+    triggerPhase,
+    status,
+    summary,
+    command: commandValue,
+    durationMs: result.durationMs,
+    logFilePath,
+    metadata: {
+      profile: verificationName,
+      exitCode: result.exitCode
+    }
+  });
+
+  return {
+    status,
+    summary,
+    durationMs: result.durationMs,
+    logFilePath,
+    exitCode: result.exitCode
+  };
+}
+
+async function persistRunCommandResult(
+  repositoryRoot: string,
+  checkpointId: string,
+  actionId: string,
+  commandValue: string,
+  triggerPhase: "beforeCheckpoint" | "afterHook" | "afterCheckpoint",
+  summaryLabel: string,
+  result: { exitCode: number; stdout: string; stderr: string; durationMs: number },
+  metadata?: Record<string, unknown>
+): Promise<{ status: "passed" | "failed"; summary: string; logFilePath: string }> {
+  const status = result.exitCode === 0 ? "passed" : "failed";
+  const summary = summarizeVerificationResult(result.exitCode, result.stdout, result.stderr);
+  const logFilePath = await writeVerificationLog(
+    repositoryRoot,
+    checkpointId,
+    actionId.replace(/[:/\\]+/g, "-"),
+    buildCommandLogContent(
+      summaryLabel,
+      checkpointId,
+      commandValue,
+      status,
+      result.exitCode,
+      result.durationMs,
+      result.stdout,
+      result.stderr
+    )
+  );
+
+  await appendOrchestrationRunRecord(repositoryRoot, checkpointId, {
+    actionId,
+    actionType: "runCommand",
+    triggerPhase,
+    status,
+    summary,
+    command: commandValue,
+    durationMs: result.durationMs,
+    logFilePath,
+    metadata: {
+      exitCode: result.exitCode,
+      ...(metadata ?? {})
+    }
+  });
+
+  return { status, summary, logFilePath };
+}
+
+async function appendOrchestrationRunRecord(
+  repositoryRoot: string,
+  checkpointId: string,
+  options: {
+    actionId: string;
+    actionType: "runExtension" | "runProfile" | "runVerification" | "runCommand";
+    triggerPhase: "beforeCheckpoint" | "afterHook" | "afterCheckpoint" | "manual";
+    status: "passed" | "failed";
+    summary: string;
+    command?: string;
+    durationMs?: number;
+    logFilePath?: string;
+    error?: string;
+    metadata?: Record<string, unknown>;
+  }
+): Promise<void> {
+  await appendGeneratedInsights(repositoryRoot, [
+    {
+      checkpointId,
+      extensionId: `orchestration:${options.actionId}`,
+      insightType: "orchestration-run",
+      title: `${options.actionType}: ${options.status}`,
+      body: options.summary,
+      createdAt: new Date().toISOString(),
+      source: "builtin",
+      metadata: {
+        actionId: options.actionId,
+        actionType: options.actionType,
+        triggerPhase: options.triggerPhase,
+        status: options.status,
+        command: options.command,
+        durationMs: options.durationMs,
+        logFilePath: options.logFilePath,
+        error: options.error,
+        ...(options.metadata ?? {})
+      }
+    }
+  ]);
+}
+
 async function dirtyWorkspaceSignature(repositoryRoot: string, files: string[]): Promise<string> {
   const hash = createHash("sha256");
 
@@ -421,7 +618,341 @@ function launchExtensionProcessor(repositoryRoot: string): void {
   child.unref();
 }
 
-async function runRegisteredExtensions(
+function launchHookOrchestrationProcessor(repositoryRoot: string): void {
+  const scriptPath = process.argv[1];
+  if (!scriptPath) {
+    return;
+  }
+
+  const child = spawn(process.execPath, [...process.execArgv, scriptPath, "__process-hook-orchestration"], {
+    cwd: repositoryRoot,
+    stdio: "ignore",
+    detached: true,
+    windowsHide: true
+  });
+  child.unref();
+}
+
+async function runExtensionForCheckpoint(
+  repositoryRoot: string,
+  store: CheckpointStore,
+  checkpointId: string,
+  extensionId: string,
+  triggerPhase: "afterHook" | "afterCheckpoint"
+): Promise<void> {
+  const checkpoint = await store.findCheckpoint(checkpointId);
+  if (!checkpoint) {
+    throw new Error(`Checkpoint ${checkpointId} was not found for extension ${extensionId}.`);
+  }
+
+  const config = await loadOrchestrationConfig(repositoryRoot);
+  const extension = config.afterCheckpoint.extensions.find((item) => item.enabled && item.id === extensionId);
+  if (!extension) {
+    throw new Error(`Enabled extension ${extensionId} was not found in orchestration config.`);
+  }
+
+  const payload: ExtensionCheckpointPayload = {
+    version: 1,
+    repositoryRoot,
+    checkpoint
+  };
+
+  const stdout = await runCommandWithInput(extension.command, repositoryRoot, JSON.stringify(payload));
+  const parsed = stdout ? (JSON.parse(stdout) as ExtensionRunnerOutput) : { insights: [] };
+  const insights = (parsed.insights ?? [])
+    .filter((item) => item && typeof item.type === "string" && typeof item.title === "string" && typeof item.body === "string")
+    .map((item) => ({
+      checkpointId,
+      extensionId: extension.id,
+      insightType: item.type,
+      title: item.title,
+      body: item.body,
+      files: Array.isArray(item.files) ? item.files.filter((file): file is string => typeof file === "string") : undefined,
+      createdAt: new Date().toISOString(),
+      source: "extension" as const
+    }));
+
+  await appendGeneratedInsights(repositoryRoot, insights);
+  await appendOrchestrationRunRecord(repositoryRoot, checkpointId, {
+    actionId: extension.id,
+    actionType: "runExtension",
+    triggerPhase,
+    status: "passed",
+    summary:
+      insights.length > 0
+        ? `Extension ${extension.id} generated ${insights.length} insight${insights.length === 1 ? "" : "s"}.`
+        : `Extension ${extension.id} completed without emitting structured insights.`,
+    command: extension.command,
+    metadata: {
+      emittedInsightCount: insights.length
+    }
+  });
+}
+
+async function runVerificationAgainstCheckpoint(
+  repositoryRoot: string,
+  checkpointId: string,
+  verificationName: string,
+  commandValue: string,
+  triggerPhase: "beforeCheckpoint" | "afterHook" | "afterCheckpoint" | "manual"
+): Promise<{
+  status: "passed" | "failed";
+  summary: string;
+  durationMs: number;
+  logFilePath: string;
+  exitCode: number;
+}> {
+  const result = await runBufferedShellCommand(commandValue, repositoryRoot);
+  return persistVerificationResult(
+    repositoryRoot,
+    checkpointId,
+    verificationName,
+    commandValue,
+    triggerPhase,
+    result
+  );
+}
+
+async function runHookOrchestrationActions(
+  repositoryRoot: string,
+  store: CheckpointStore,
+  event: HookOrchestrationEvent
+): Promise<void> {
+  const config = await loadOrchestrationConfig(repositoryRoot);
+  const matchingRules = config.afterHook.rules.filter(
+    (rule) => rule.mode === "background" && matchesAfterHookRule(rule, event)
+  );
+
+  for (const rule of matchingRules) {
+    for (const action of rule.actions) {
+      try {
+        if (action.type === "runCommand") {
+          const command = action.command;
+          if (!command) {
+            throw new Error(`Rule ${rule.id} is missing a command for runCommand.`);
+          }
+
+          const result = await runBufferedShellCommand(command, repositoryRoot);
+          const status = result.exitCode === 0 ? "passed" : "failed";
+          const summary = summarizeVerificationResult(result.exitCode, result.stdout, result.stderr);
+          const logFilePath = await writeVerificationLog(
+            repositoryRoot,
+            event.checkpointId ?? "hook-context",
+            `orchestration-${rule.id}-${action.type}`,
+            [
+              `rule: ${rule.id}`,
+              `hook: ${event.host}:${event.event}`,
+              `command: ${command}`,
+              `status: ${status}`,
+              `exitCode: ${result.exitCode}`,
+              `durationMs: ${result.durationMs}`,
+              "",
+              "--- stdout ---",
+              result.stdout.trimEnd(),
+              "",
+              "--- stderr ---",
+              result.stderr.trimEnd(),
+              ""
+            ].join("\n")
+          );
+
+          await appendOrchestrationRunRecord(repositoryRoot, event.checkpointId ?? "hook-context", {
+            actionId: `${rule.id}:${action.type}`,
+            actionType: "runCommand",
+            triggerPhase: "afterHook",
+            status,
+            summary,
+            command,
+            durationMs: result.durationMs,
+            logFilePath,
+            metadata: {
+              host: event.host,
+              event: event.event,
+              ruleId: rule.id,
+              files: event.files,
+              exitCode: result.exitCode
+            }
+          });
+
+          if (status === "failed") {
+            break;
+          }
+          continue;
+        }
+
+        if (!event.checkpointId) {
+          throw new Error(`Rule ${rule.id} action ${action.type} requires checkpoint context.`);
+        }
+
+        if (action.type === "runProfile" || action.type === "runVerification") {
+          const profileId = action.profile;
+          const profile = config.afterCheckpoint.verifications.profiles.find((item) => item.id === profileId);
+          if (!profileId || !profile) {
+            throw new Error(`Rule ${rule.id} references missing profile ${profileId ?? "unknown"}.`);
+          }
+          const result = await runVerificationAgainstCheckpoint(
+            repositoryRoot,
+            event.checkpointId,
+            profile.id,
+            profile.command,
+            "afterHook"
+          );
+          if (result.status === "failed") {
+            break;
+          }
+          continue;
+        }
+
+        if (action.type === "runExtension") {
+          const extensionId = action.extensionId;
+          if (!extensionId) {
+            throw new Error(`Rule ${rule.id} is missing extensionId for runExtension.`);
+          }
+          await runExtensionForCheckpoint(repositoryRoot, store, event.checkpointId, extensionId, "afterHook");
+          continue;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await appendOrchestrationRunRecord(repositoryRoot, event.checkpointId ?? "hook-context", {
+          actionId: `${rule.id}:${action.type}`,
+          actionType: action.type,
+          triggerPhase: "afterHook",
+          status: "failed",
+          summary: `Hook orchestration rule ${rule.id} failed while running ${action.type}.`,
+          command: action.command,
+          error: message,
+          metadata: {
+            host: event.host,
+            event: event.event,
+            ruleId: rule.id,
+            files: event.files,
+            profile: action.profile,
+            extensionId: action.extensionId
+          }
+        });
+        break;
+      }
+    }
+  }
+}
+
+type PreparedBeforeCheckpointAction =
+  | {
+      kind: "runCommand";
+      actionId: string;
+      ruleId: string;
+      command: string;
+      result: { exitCode: number; stdout: string; stderr: string; durationMs: number };
+      files: string[];
+    }
+  | {
+      kind: "runProfile";
+      actionId: string;
+      ruleId: string;
+      profile: string;
+      command: string;
+      result: { exitCode: number; stdout: string; stderr: string; durationMs: number };
+      files: string[];
+    };
+
+async function runBeforeCheckpointBlockingActions(
+  repositoryRoot: string,
+  files: string[]
+): Promise<PreparedBeforeCheckpointAction[]> {
+  const config = await loadOrchestrationConfig(repositoryRoot);
+  const prepared: PreparedBeforeCheckpointAction[] = [];
+  const matchingRules = config.beforeCheckpoint.rules.filter(
+    (rule) => rule.mode === "blocking" && matchesAfterCheckpointRule(rule, files)
+  );
+
+  for (const rule of matchingRules) {
+    for (const action of rule.actions) {
+      if (action.type === "runExtension") {
+        throw new Error(`beforeCheckpoint rule ${rule.id} cannot run extensions before checkpoint creation.`);
+      }
+
+      if (action.type === "runCommand") {
+        const command = action.command;
+        if (!command) {
+          throw new Error(`beforeCheckpoint rule ${rule.id} is missing a command for runCommand.`);
+        }
+
+        const result = await runBufferedShellCommand(command, repositoryRoot);
+        prepared.push({
+          kind: "runCommand",
+          actionId: `${rule.id}:${action.type}`,
+          ruleId: rule.id,
+          command,
+          result,
+          files
+        });
+        if (result.exitCode !== 0) {
+          throw new Error(`beforeCheckpoint rule ${rule.id} failed while running ${command}.`);
+        }
+        continue;
+      }
+
+      const profileId = action.profile;
+      const profile = config.afterCheckpoint.verifications.profiles.find((item) => item.id === profileId);
+      if (!profileId || !profile) {
+        throw new Error(`beforeCheckpoint rule ${rule.id} references missing profile ${profileId ?? "<missing>"}.`);
+      }
+
+      const result = await runBufferedShellCommand(profile.command, repositoryRoot);
+      prepared.push({
+        kind: "runProfile",
+        actionId: `${rule.id}:${action.type}`,
+        ruleId: rule.id,
+        profile: profile.id,
+        command: profile.command,
+        result,
+        files
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(`beforeCheckpoint rule ${rule.id} failed while running profile ${profile.id}.`);
+      }
+    }
+  }
+
+  return prepared;
+}
+
+async function persistPreparedBeforeCheckpointActions(
+  repositoryRoot: string,
+  checkpointId: string,
+  prepared: PreparedBeforeCheckpointAction[]
+): Promise<void> {
+  for (const action of prepared) {
+    if (action.kind === "runCommand") {
+      await persistRunCommandResult(
+        repositoryRoot,
+        checkpointId,
+        action.actionId,
+        action.command,
+        "beforeCheckpoint",
+        action.ruleId,
+        action.result,
+        {
+          checkpointId,
+          ruleId: action.ruleId,
+          files: action.files
+        }
+      );
+      continue;
+    }
+
+    await persistVerificationResult(
+      repositoryRoot,
+      checkpointId,
+      action.profile,
+      action.command,
+      "beforeCheckpoint",
+      action.result
+    );
+  }
+}
+
+async function runAfterCheckpointBlockingActions(
   repositoryRoot: string,
   store: CheckpointStore,
   checkpointId: string
@@ -431,42 +962,278 @@ async function runRegisteredExtensions(
     return;
   }
 
-  const config = await loadExtensionsConfig(repositoryRoot);
-  const enabled = config.extensions.filter((extension) => extension.enabled);
-  if (enabled.length === 0) {
-    return;
-  }
+  const config = await loadOrchestrationConfig(repositoryRoot);
+  const matchingRules = config.afterCheckpoint.rules.filter(
+    (rule) => rule.mode === "blocking" && matchesAfterCheckpointRule(rule, checkpoint.filesChanged)
+  );
 
-  const payload: ExtensionCheckpointPayload = {
-    version: 1,
-    repositoryRoot,
-    checkpoint
-  };
+  for (const rule of matchingRules) {
+    for (const action of rule.actions) {
+      if (action.type === "runCommand") {
+        const command = action.command;
+        if (!command) {
+          throw new Error(`Rule ${rule.id} is missing a command for runCommand.`);
+        }
 
-  for (const extension of enabled) {
-    try {
-      const stdout = await runCommandWithInput(extension.command, repositoryRoot, JSON.stringify(payload));
-      if (!stdout) {
+        const result = await runBufferedShellCommand(command, repositoryRoot);
+        const persisted = await persistRunCommandResult(
+          repositoryRoot,
+          checkpointId,
+          `${rule.id}:${action.type}`,
+          command,
+          "afterCheckpoint",
+          rule.id,
+          result,
+          {
+            checkpointId,
+            ruleId: rule.id,
+            files: checkpoint.filesChanged
+          }
+        );
+        if (persisted.status === "failed") {
+          throw new Error(`Rule ${rule.id} failed while running ${command}.`);
+        }
         continue;
       }
 
-      const parsed = JSON.parse(stdout) as ExtensionRunnerOutput;
-      const insights = (parsed.insights ?? [])
-        .filter((item) => item && typeof item.type === "string" && typeof item.title === "string" && typeof item.body === "string")
-        .map((item) => ({
+      if (action.type === "runProfile" || action.type === "runVerification") {
+        const profileId = action.profile;
+        const profile = config.afterCheckpoint.verifications.profiles.find((item) => item.id === profileId);
+        if (!profileId || !profile) {
+          throw new Error(`Rule ${rule.id} references missing profile ${profileId ?? "<missing>"}.`);
+        }
+        const result = await runVerificationAgainstCheckpoint(
+          repositoryRoot,
           checkpointId,
-          extensionId: extension.id,
-          insightType: item.type,
-          title: item.title,
-          body: item.body,
-          files: Array.isArray(item.files) ? item.files.filter((file): file is string => typeof file === "string") : undefined,
-          createdAt: new Date().toISOString(),
-          source: "extension" as const
-        }));
+          profile.id,
+          profile.command,
+          "afterCheckpoint"
+        );
+        if (result.status === "failed") {
+          throw new Error(`Rule ${rule.id} failed while running profile ${profile.id}.`);
+        }
+        continue;
+      }
 
-      await appendGeneratedInsights(repositoryRoot, insights);
-    } catch {
-      // Extension execution is best-effort and should not break checkpoint flow.
+      const extensionId = action.extensionId;
+      if (!extensionId) {
+        throw new Error(`Rule ${rule.id} is missing extensionId for runExtension.`);
+      }
+      await runExtensionForCheckpoint(repositoryRoot, store, checkpointId, extensionId, "afterCheckpoint");
+    }
+  }
+}
+
+async function runAfterCheckpointActions(
+  repositoryRoot: string,
+  store: CheckpointStore,
+  checkpointId: string
+): Promise<void> {
+  const checkpoint = await store.findCheckpoint(checkpointId);
+  if (!checkpoint) {
+    return;
+  }
+
+  const config = await loadOrchestrationConfig(repositoryRoot);
+  const beforeCheckpointRules = config.beforeCheckpoint.rules.filter(
+    (rule) => rule.mode === "background" && matchesAfterCheckpointRule(rule, checkpoint.filesChanged)
+  );
+  const matchingRules = config.afterCheckpoint.rules.filter(
+    (rule) => rule.mode === "background" && matchesAfterCheckpointRule(rule, checkpoint.filesChanged)
+  );
+  const enabledLegacyExtensions = config.afterCheckpoint.extensions.filter((extension) => extension.enabled);
+
+  if (beforeCheckpointRules.length === 0 && matchingRules.length === 0 && enabledLegacyExtensions.length === 0) {
+    return;
+  }
+
+  for (const rule of beforeCheckpointRules) {
+    for (const action of rule.actions) {
+      try {
+        if (action.type === "runExtension") {
+          throw new Error(`beforeCheckpoint rule ${rule.id} cannot run extensions without checkpoint context preparation.`);
+        }
+
+        if (action.type === "runCommand") {
+          const command = action.command;
+          if (!command) {
+            throw new Error(`Rule ${rule.id} is missing a command for runCommand.`);
+          }
+
+          const result = await runBufferedShellCommand(command, repositoryRoot);
+          await persistRunCommandResult(
+            repositoryRoot,
+            checkpointId,
+            `${rule.id}:${action.type}`,
+            command,
+            "beforeCheckpoint",
+            rule.id,
+            result,
+            {
+              checkpointId,
+              ruleId: rule.id,
+              files: checkpoint.filesChanged
+            }
+          );
+          if (result.exitCode !== 0) {
+            break;
+          }
+          continue;
+        }
+
+        const profileId = action.profile;
+        const profile = config.afterCheckpoint.verifications.profiles.find((item) => item.id === profileId);
+        if (!profileId || !profile) {
+          throw new Error(`Rule ${rule.id} references missing profile ${profileId ?? "<missing>"}.`);
+        }
+
+        const result = await runVerificationAgainstCheckpoint(
+          repositoryRoot,
+          checkpointId,
+          profile.id,
+          profile.command,
+          "beforeCheckpoint"
+        );
+        if (result.status === "failed") {
+          break;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await appendOrchestrationRunRecord(repositoryRoot, checkpointId, {
+          actionId: `${rule.id}:${action.type}`,
+          actionType: action.type,
+          triggerPhase: "beforeCheckpoint",
+          status: "failed",
+          summary: `Rule ${rule.id} failed during beforeCheckpoint background processing.`,
+          command: action.command,
+          error: message,
+          metadata: {
+            checkpointId,
+            ruleId: rule.id,
+            files: checkpoint.filesChanged,
+            profile: action.profile,
+            extensionId: action.extensionId
+          }
+        });
+        break;
+      }
+    }
+  }
+
+  for (const rule of matchingRules) {
+    for (const action of rule.actions) {
+      try {
+        if (action.type === "runCommand") {
+          const command = action.command;
+          if (!command) {
+            throw new Error(`Rule ${rule.id} is missing a command for runCommand.`);
+          }
+
+          const result = await runBufferedShellCommand(command, repositoryRoot);
+          const status = result.exitCode === 0 ? "passed" : "failed";
+          const summary = summarizeVerificationResult(result.exitCode, result.stdout, result.stderr);
+          const logFilePath = await writeVerificationLog(
+            repositoryRoot,
+            checkpointId,
+            `orchestration-${rule.id}-${action.type}`,
+            [
+              `rule: ${rule.id}`,
+              `checkpoint: ${checkpointId}`,
+              `command: ${command}`,
+              `status: ${status}`,
+              `exitCode: ${result.exitCode}`,
+              `durationMs: ${result.durationMs}`,
+              "",
+              "--- stdout ---",
+              result.stdout.trimEnd(),
+              "",
+              "--- stderr ---",
+              result.stderr.trimEnd(),
+              ""
+            ].join("\n")
+          );
+
+          await appendOrchestrationRunRecord(repositoryRoot, checkpointId, {
+            actionId: `${rule.id}:${action.type}`,
+            actionType: "runCommand",
+            triggerPhase: "afterCheckpoint",
+            status,
+            summary,
+            command,
+            durationMs: result.durationMs,
+            logFilePath,
+            metadata: {
+              checkpointId,
+              ruleId: rule.id,
+              files: checkpoint.filesChanged
+            }
+          });
+        } else if (action.type === "runProfile" || action.type === "runVerification") {
+          const profileId = action.profile;
+          const profile = config.afterCheckpoint.verifications.profiles.find((item) => item.id === profileId);
+          if (!profileId || !profile) {
+            throw new Error(`Rule ${rule.id} references missing profile ${profileId ?? "<missing>"}.`);
+          }
+
+          await runVerificationAgainstCheckpoint(
+            repositoryRoot,
+            checkpointId,
+            profile.id,
+            profile.command,
+            "afterCheckpoint"
+          );
+        } else if (action.type === "runExtension") {
+          const extensionId = action.extensionId;
+          if (!extensionId) {
+            throw new Error(`Rule ${rule.id} is missing extensionId for runExtension.`);
+          }
+
+          await runExtensionForCheckpoint(repositoryRoot, store, checkpointId, extensionId, "afterCheckpoint");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await appendOrchestrationRunRecord(repositoryRoot, checkpointId, {
+          actionId: `${rule.id}:${action.type}`,
+          actionType: action.type,
+          triggerPhase: "afterCheckpoint",
+          status: "failed",
+          summary: `Rule ${rule.id} failed during afterCheckpoint processing.`,
+          command: action.command,
+          error: message,
+          metadata: {
+            checkpointId,
+            ruleId: rule.id,
+            files: checkpoint.filesChanged,
+            profile: action.profile,
+            extensionId: action.extensionId
+          }
+        });
+        break;
+      }
+    }
+  }
+
+  for (const extension of enabledLegacyExtensions) {
+    const alreadyHandledByRule = matchingRules.some((rule) =>
+      rule.actions.some((action) => action.type === "runExtension" && action.extensionId === extension.id)
+    );
+    if (alreadyHandledByRule) {
+      continue;
+    }
+
+    try {
+      await runExtensionForCheckpoint(repositoryRoot, store, checkpointId, extension.id, "afterCheckpoint");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await appendOrchestrationRunRecord(repositoryRoot, checkpointId, {
+        actionId: extension.id,
+        actionType: "runExtension",
+        triggerPhase: "afterCheckpoint",
+        status: "failed",
+        summary: `Extension ${extension.id} failed during afterCheckpoint processing.`,
+        command: extension.command,
+        error: message
+      });
     }
   }
 }
@@ -553,7 +1320,7 @@ async function printHookStatus(
   const copilotHookFile = vscodeCopilotHookConfigPath(repositoryRoot);
   const codexHookFile = codexHookConfigPath(repositoryRoot);
   const policyFile = path.join(repositoryRoot, ".anvil", "policy.yaml");
-  const extensionsFile = path.join(repositoryRoot, ".anvil", "extensions.yaml");
+  const orchestrationFile = path.join(repositoryRoot, ".anvil", "orchestration.yaml");
   const guardScriptFile = executionGuardScriptPath(repositoryRoot);
   const codexPromptWrapperFile = codexPromptWrapperPath(repositoryRoot);
   const copilotPromptWrapperFile = copilotPromptWrapperPath(repositoryRoot);
@@ -573,7 +1340,7 @@ async function printHookStatus(
   console.log("Hook config");
   console.log(`  ${formatStatusLine(".anvil/hooks.yaml", existsSync(hookConfigFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine(".anvil/policy.yaml", existsSync(policyFile) ? "present" : "missing")}`);
-  console.log(`  ${formatStatusLine(".anvil/extensions.yaml", existsSync(extensionsFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".anvil/orchestration.yaml", existsSync(orchestrationFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine(".anvil/anvil-execution-guard.mjs", existsSync(guardScriptFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine(".anvil/anvil-codex-prompt-submit.mjs", existsSync(codexPromptWrapperFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine(".anvil/anvil-copilot-prompt-submit.mjs", existsSync(copilotPromptWrapperFile) ? "present" : "missing")}`);
@@ -660,7 +1427,7 @@ async function main(): Promise<void> {
       const codexHookPath = await installCodexHook(repositoryRoot);
       const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
       const policyTemplate = await ensurePolicyTemplate(repositoryRoot);
-      const extensionsTemplate = await ensureExtensionsTemplate(repositoryRoot);
+      const orchestrationTemplate = await ensureOrchestrationTemplate(repositoryRoot);
       const anvilIgnore = await ensureAnvilIgnoreTemplate(repositoryRoot);
       console.log(`Anvil initialized for ${repositoryRoot}`);
       console.log(`State directory: ${path.dirname(config.shadowGitDir)}`);
@@ -671,7 +1438,10 @@ async function main(): Promise<void> {
       console.log(`Codex hook: ${codexHookPath}`);
       console.log(`Hook config: ${hookConfigPath}`);
       console.log(`Execution policy: ${policyTemplate.filePath}`);
-      console.log(`Extensions config: ${extensionsTemplate.filePath}`);
+      console.log(`Orchestration config: ${orchestrationTemplate.filePath}`);
+      if (orchestrationTemplate.migratedFromLegacy) {
+        console.log("Orchestration config was created by migrating the legacy .anvil/extensions.yaml file.");
+      }
       if (anvilIgnore.source === "gitignore") {
         console.log("Anvil ignore was created by copying .gitignore.");
       } else if (anvilIgnore.source === "starter") {
@@ -699,11 +1469,14 @@ async function main(): Promise<void> {
       const hookPath = await installVSCodeCopilotHook(repositoryRoot);
       const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
       const policyTemplate = await ensurePolicyTemplate(repositoryRoot);
-      const extensionsTemplate = await ensureExtensionsTemplate(repositoryRoot);
+      const orchestrationTemplate = await ensureOrchestrationTemplate(repositoryRoot);
       console.log(`Installed VS Code Copilot hook at ${hookPath}`);
       console.log(`Hook config: ${hookConfigPath}`);
       console.log(`Execution policy: ${policyTemplate.filePath}`);
-      console.log(`Extensions config: ${extensionsTemplate.filePath}`);
+      console.log(`Orchestration config: ${orchestrationTemplate.filePath}`);
+      if (orchestrationTemplate.migratedFromLegacy) {
+        console.log("Orchestration config was created by migrating the legacy .anvil/extensions.yaml file.");
+      }
       console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Copilot file edits.");
       return;
     }
@@ -713,11 +1486,14 @@ async function main(): Promise<void> {
       const hookPath = await installCodexHook(repositoryRoot);
       const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
       const policyTemplate = await ensurePolicyTemplate(repositoryRoot);
-      const extensionsTemplate = await ensureExtensionsTemplate(repositoryRoot);
+      const orchestrationTemplate = await ensureOrchestrationTemplate(repositoryRoot);
       console.log(`Installed Codex hook at ${hookPath}`);
       console.log(`Hook config: ${hookConfigPath}`);
       console.log(`Execution policy: ${policyTemplate.filePath}`);
-      console.log(`Extensions config: ${extensionsTemplate.filePath}`);
+      console.log(`Orchestration config: ${orchestrationTemplate.filePath}`);
+      if (orchestrationTemplate.migratedFromLegacy) {
+        console.log("Orchestration config was created by migrating the legacy .anvil/extensions.yaml file.");
+      }
       console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Codex file edits.");
       return;
     }
@@ -823,6 +1599,14 @@ async function main(): Promise<void> {
         files: filePaths.length > 0 ? filePaths : undefined,
         message: `${evaluation.category}: ${evaluation.reason} ${evaluation.nextStep}`.trim()
       });
+      await appendPendingHookOrchestrationEvent(repositoryRoot, {
+        hookName,
+        host: vscodeHookMode ? "copilot" : "codex",
+        event: isCodexPermissionRequest ? "PermissionRequest" : "PreToolUse",
+        files: filePaths,
+        timestamp: new Date().toISOString()
+      });
+      launchHookOrchestrationProcessor(repositoryRoot);
 
       const explanation = `${evaluation.category}: ${evaluation.reason}`;
       const additionalContext = `${evaluation.reason} ${evaluation.nextStep}`.trim();
@@ -863,7 +1647,16 @@ async function main(): Promise<void> {
       await store.init();
       const checkpointIds = await consumePendingExtensionEvents(repositoryRoot);
       for (const checkpointId of checkpointIds) {
-        await runRegisteredExtensions(repositoryRoot, store, checkpointId);
+        await runAfterCheckpointActions(repositoryRoot, store, checkpointId);
+      }
+      return;
+    }
+
+    case "__process-hook-orchestration": {
+      await store.init();
+      const events = await consumePendingHookOrchestrationEvents(repositoryRoot);
+      for (const event of events) {
+        await runHookOrchestrationActions(repositoryRoot, store, event);
       }
       return;
     }
@@ -990,6 +1783,14 @@ async function main(): Promise<void> {
 
         const config = await loadHookConfig(repositoryRoot);
         if (!config.codex?.autoCheckpoint) {
+          await appendPendingHookOrchestrationEvent(repositoryRoot, {
+            hookName,
+            host: "codex",
+            event: "UserPromptSubmit",
+            files: [],
+            timestamp: new Date().toISOString()
+          });
+          launchHookOrchestrationProcessor(repositoryRoot);
           await appendHookExecutionLog(repositoryRoot, {
             timestamp: new Date().toISOString(),
             hookName,
@@ -1004,6 +1805,14 @@ async function main(): Promise<void> {
         const prompt = optionValue(args, "--prompt") ?? extractCodexHookPrompt(codexHookInput);
         const rationale = optionValue(args, "--rationale") ?? extractCodexHookRationale(codexHookInput);
         if (!prompt) {
+          await appendPendingHookOrchestrationEvent(repositoryRoot, {
+            hookName,
+            host: "codex",
+            event: "UserPromptSubmit",
+            files: [],
+            timestamp: new Date().toISOString()
+          });
+          launchHookOrchestrationProcessor(repositoryRoot);
           await appendHookExecutionLog(repositoryRoot, {
             timestamp: new Date().toISOString(),
             hookName,
@@ -1024,6 +1833,14 @@ async function main(): Promise<void> {
           branch: await resolvedBranchLabel(store),
           message: "Captured Codex prompt for the next Anvil checkpoint."
         });
+        await appendPendingHookOrchestrationEvent(repositoryRoot, {
+          hookName,
+          host: "codex",
+          event: "UserPromptSubmit",
+          files: [],
+          timestamp: new Date().toISOString()
+        });
+        launchHookOrchestrationProcessor(repositoryRoot);
         if (!codexHookMode) {
           console.log("Captured Codex prompt for the next Anvil checkpoint.");
         }
@@ -1045,6 +1862,14 @@ async function main(): Promise<void> {
 
         const config = await loadHookConfig(repositoryRoot);
         if (!config.copilot?.autoCheckpoint) {
+          await appendPendingHookOrchestrationEvent(repositoryRoot, {
+            hookName,
+            host: "copilot",
+            event: "UserPromptSubmit",
+            files: [],
+            timestamp: new Date().toISOString()
+          });
+          launchHookOrchestrationProcessor(repositoryRoot);
           await appendHookExecutionLog(repositoryRoot, {
             timestamp: new Date().toISOString(),
             hookName,
@@ -1060,6 +1885,14 @@ async function main(): Promise<void> {
         const prompt = optionValue(args, "--prompt") ?? extractVSCodeHookPrompt(vscodeHookInput);
         const rationale = optionValue(args, "--rationale") ?? extractVSCodeHookRationale(vscodeHookInput);
         if (!prompt) {
+          await appendPendingHookOrchestrationEvent(repositoryRoot, {
+            hookName,
+            host: "copilot",
+            event: "UserPromptSubmit",
+            files: [],
+            timestamp: new Date().toISOString()
+          });
+          launchHookOrchestrationProcessor(repositoryRoot);
           await appendHookExecutionLog(repositoryRoot, {
             timestamp: new Date().toISOString(),
             hookName,
@@ -1081,6 +1914,14 @@ async function main(): Promise<void> {
           branch: await resolvedBranchLabel(store),
           message: "Captured Copilot prompt for the next Anvil checkpoint."
         });
+        await appendPendingHookOrchestrationEvent(repositoryRoot, {
+          hookName,
+          host: "copilot",
+          event: "UserPromptSubmit",
+          files: [],
+          timestamp: new Date().toISOString()
+        });
+        launchHookOrchestrationProcessor(repositoryRoot);
         emitVSCodeHookResponse("Captured Copilot prompt for the next Anvil checkpoint.");
         return;
       }
@@ -1107,9 +1948,26 @@ async function main(): Promise<void> {
         return;
       }
 
+      const hookFiles = vscodeHookMode
+        ? extractHookFilePaths(vscodeHookInput)
+        : codexHookMode
+          ? (() => {
+              const extracted = extractCodexHookFilePaths(codexHookInput);
+              return extracted.length > 0 ? extracted : extractCodexHookFilePathsFromText(stdInText);
+            })()
+          : [];
+
       const config = await loadHookConfig(repositoryRoot);
       const hookConfig = hookName === "copilot-after-edit" ? config.copilot : config.codex;
       if (!hookConfig?.autoCheckpoint) {
+        await appendPendingHookOrchestrationEvent(repositoryRoot, {
+          hookName,
+          host: hookName === "copilot-after-edit" ? "copilot" : "codex",
+          event: "PostToolUse",
+          files: hookFiles,
+          timestamp: new Date().toISOString()
+        });
+        launchHookOrchestrationProcessor(repositoryRoot);
         await appendHookExecutionLog(repositoryRoot, {
           timestamp: new Date().toISOString(),
           hookName,
@@ -1150,14 +2008,6 @@ async function main(): Promise<void> {
         ?? pendingCopilotPrompt?.prompt
         ?? pendingCodexPrompt?.prompt
         ?? undefined;
-      const hookFiles = vscodeHookMode
-        ? extractHookFilePaths(vscodeHookInput)
-        : codexHookMode
-          ? (() => {
-              const extracted = extractCodexHookFilePaths(codexHookInput);
-              return extracted.length > 0 ? extracted : extractCodexHookFilePathsFromText(stdInText);
-            })()
-          : [];
       const statusFiles = await gitStatusFiles(repositoryRoot, ignoreRules);
       const files = vscodeHookMode
         ? [...new Set(filterIgnoredAnvilPaths([...hookFiles, ...statusFiles], ignoreRules))]
@@ -1187,6 +2037,8 @@ async function main(): Promise<void> {
         return;
       }
 
+      const preparedBeforeCheckpoint = await runBeforeCheckpointBlockingActions(repositoryRoot, files);
+
       const checkpoint = await store.recordCheckpoint({
         kind,
         summary,
@@ -1199,6 +2051,9 @@ async function main(): Promise<void> {
         commandsRun: commandValue ? [commandValue] : [],
         testStatus
       });
+
+      await persistPreparedBeforeCheckpointActions(repositoryRoot, checkpoint.checkpointId, preparedBeforeCheckpoint);
+      await runAfterCheckpointBlockingActions(repositoryRoot, store, checkpoint.checkpointId);
 
       if (vscodeHookMode && (prompt || pendingCopilotPrompt?.prompt)) {
         await clearPendingCopilotPrompt(repositoryRoot);
@@ -1217,6 +2072,15 @@ async function main(): Promise<void> {
         files: checkpoint.filesChanged,
         message: `Recorded ${checkpoint.checkpointId}.`
       });
+      await appendPendingHookOrchestrationEvent(repositoryRoot, {
+        hookName,
+        host: hookName === "copilot-after-edit" ? "copilot" : "codex",
+        event: "PostToolUse",
+        files: checkpoint.filesChanged,
+        checkpointId: checkpoint.checkpointId,
+        timestamp: new Date().toISOString()
+      });
+      launchHookOrchestrationProcessor(repositoryRoot);
 
       if (vscodeHookMode) {
         launchExtensionProcessor(repositoryRoot);
@@ -1327,6 +2191,8 @@ async function main(): Promise<void> {
             continue;
           }
 
+          const preparedBeforeCheckpoint = await runBeforeCheckpointBlockingActions(repositoryRoot, pendingFiles);
+
           const checkpoint = await store.recordCheckpoint({
             kind,
             summary,
@@ -1337,6 +2203,9 @@ async function main(): Promise<void> {
             commandsRun: commandValue ? [commandValue] : [],
             testStatus
           });
+
+          await persistPreparedBeforeCheckpointActions(repositoryRoot, checkpoint.checkpointId, preparedBeforeCheckpoint);
+          await runAfterCheckpointBlockingActions(repositoryRoot, store, checkpoint.checkpointId);
 
           launchExtensionProcessor(repositoryRoot);
           lastRecordedSignature = signature;
@@ -1361,17 +2230,18 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "run":
     case "verify": {
       await store.init();
-      const config = await loadExtensionsConfig(repositoryRoot);
+      const config = await loadOrchestrationConfig(repositoryRoot);
       const profileId = args[0] && !args[0].startsWith("-") ? args[0] : optionValue(args, "--name");
-      const profile = findVerificationProfile(config.verifications.profiles, profileId ?? null);
+      const profile = findVerificationProfile(config.afterCheckpoint.verifications.profiles, profileId ?? null);
       const commandValue = optionValue(args, "--command") ?? profile?.command ?? null;
-      const verificationName = optionValue(args, "--name") ?? profile?.id ?? profileId ?? "custom";
+      const profileName = optionValue(args, "--name") ?? profile?.id ?? profileId ?? "custom";
       const checkpointId = optionValue(args, "--checkpoint");
 
       if (!commandValue) {
-        throw new Error("verify requires a configured profile name or --command \"...\"");
+        throw new Error(`${command} requires a configured profile name or --command "..."`);
       }
 
       const checkpoint =
@@ -1387,52 +2257,23 @@ async function main(): Promise<void> {
         );
       }
 
-      const result = await runBufferedShellCommand(commandValue, repositoryRoot);
-      const status = result.exitCode === 0 ? "passed" : "failed";
-      const summary = summarizeVerificationResult(result.exitCode, result.stdout, result.stderr);
-      const logContent = [
-        `profile: ${verificationName}`,
-        `checkpoint: ${checkpoint.checkpointId}`,
-        `command: ${commandValue}`,
-        `status: ${status}`,
-        `exitCode: ${result.exitCode}`,
-        `durationMs: ${result.durationMs}`,
-        "",
-        "--- stdout ---",
-        result.stdout.trimEnd(),
-        "",
-        "--- stderr ---",
-        result.stderr.trimEnd(),
-        ""
-      ].join("\n");
-      const logFilePath = await writeVerificationLog(repositoryRoot, checkpoint.checkpointId, verificationName, logContent);
+      const result = await runVerificationAgainstCheckpoint(
+        repositoryRoot,
+        checkpoint.checkpointId,
+        profileName,
+        commandValue,
+        "manual"
+      );
 
-      await appendGeneratedInsights(repositoryRoot, [
-        {
-          checkpointId: checkpoint.checkpointId,
-          extensionId: `verification:${verificationName}`,
-          insightType: "verification",
-          title: `${verificationName}: ${status}`,
-          body: summary,
-          createdAt: new Date().toISOString(),
-          source: "builtin",
-          metadata: {
-            profile: verificationName,
-            command: commandValue,
-            status,
-            exitCode: result.exitCode,
-            durationMs: result.durationMs,
-            logFilePath
-          }
-        }
-      ]);
-
-      console.log(`Verification ${verificationName}: ${status}`);
+      console.log(`Profile ${profileName}: ${result.status}`);
       console.log(`Checkpoint: ${checkpoint.checkpointId}`);
       console.log(`Command: ${commandValue}`);
       console.log(`Duration: ${result.durationMs}ms`);
-      console.log(`Summary: ${summary}`);
-      console.log(`Log: ${logFilePath}`);
+      console.log(`Summary: ${result.summary}`);
+      console.log(`Log: ${result.logFilePath}`);
+      if (command === "verify") {
+        console.log('Alias note: `anvil verify` is supported for compatibility; prefer `anvil run <profile>`.');
+      }
       return;
     }
 
@@ -1484,6 +2325,8 @@ async function main(): Promise<void> {
         return;
       }
 
+      const preparedBeforeCheckpoint = await runBeforeCheckpointBlockingActions(repositoryRoot, files);
+
       const checkpoint = await store.recordCheckpoint({
         kind: kind as "after_edit_batch",
         summary,
@@ -1496,6 +2339,9 @@ async function main(): Promise<void> {
         rationale: rationale ?? undefined,
         testStatus: testStatus ?? "unknown"
       });
+
+      await persistPreparedBeforeCheckpointActions(repositoryRoot, checkpoint.checkpointId, preparedBeforeCheckpoint);
+      await runAfterCheckpointBlockingActions(repositoryRoot, store, checkpoint.checkpointId);
 
       launchExtensionProcessor(repositoryRoot);
       console.log(`Recorded ${checkpoint.checkpointId}`);
@@ -1617,10 +2463,13 @@ async function main(): Promise<void> {
       const aiSource = optionValue(args, "--ai-source");
       const testStatus = optionValue(args, "--test-status") as "unknown" | "passed" | "failed" | null;
 
+      const recordFiles = files ? files.split(",").map((item) => item.trim()).filter(Boolean) : undefined;
+      const preparedBeforeCheckpoint = await runBeforeCheckpointBlockingActions(repositoryRoot, recordFiles ?? []);
+
       const checkpoint = await store.recordCheckpoint({
         kind: kind as "after_edit_batch",
         summary,
-        filesChanged: files ? files.split(",").map((item) => item.trim()).filter(Boolean) : undefined,
+        filesChanged: recordFiles,
         origin: (originValue as "ai" | "manual" | null) ?? (prompt || rationale || aiSource ? "ai" : "manual"),
         aiSource: aiSource ?? null,
         commandsRun: commandValue ? [commandValue] : [],
@@ -1628,6 +2477,9 @@ async function main(): Promise<void> {
         rationale: rationale ?? undefined,
         testStatus: testStatus ?? "unknown"
       });
+
+      await persistPreparedBeforeCheckpointActions(repositoryRoot, checkpoint.checkpointId, preparedBeforeCheckpoint);
+      await runAfterCheckpointBlockingActions(repositoryRoot, store, checkpoint.checkpointId);
 
       launchExtensionProcessor(repositoryRoot);
       console.log(`Recorded ${checkpoint.checkpointId}`);

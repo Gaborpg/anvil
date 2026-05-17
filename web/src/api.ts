@@ -1,4 +1,14 @@
-import type { BranchListResponse, DiffResponse, ExplainItem, ExportPreviewResponse, FileSnapshotResponse, TimelineResponse } from "./types";
+import type {
+  BranchListResponse,
+  DiffResponse,
+  ExplainItem,
+  ExportPreviewResponse,
+  FileSnapshotResponse,
+  OrchestrationRunListResponse,
+  TimelineResponse,
+  VerificationLogContentResponse,
+  VerificationLogListResponse
+} from "./types";
 
 function withRepo(pathname: string, repo?: string): string {
   if (!repo) {
@@ -29,6 +39,33 @@ export function fetchBranches(repo?: string): Promise<BranchListResponse> {
 
 export function fetchCheckpoint(checkpointId: string, repo?: string): Promise<ExplainItem> {
   return readJson<ExplainItem>(withRepo(`/api/checkpoints/${checkpointId}`, repo));
+}
+
+export function fetchVerificationLogs(checkpointId: string, repo?: string): Promise<VerificationLogListResponse> {
+  return readJson<VerificationLogListResponse>(withRepo(`/api/checkpoints/${checkpointId}/verification-logs`, repo));
+}
+
+export function fetchVerificationLogContent(
+  checkpointId: string,
+  logFilePath: string,
+  repo?: string
+): Promise<VerificationLogContentResponse> {
+  const query = new URLSearchParams({ path: logFilePath });
+  const pathWithQuery = `/api/checkpoints/${checkpointId}/verification-logs/content?${query.toString()}`;
+  return readJson<VerificationLogContentResponse>(withRepo(pathWithQuery, repo));
+}
+
+export function fetchOrchestrationRuns(repo?: string): Promise<OrchestrationRunListResponse> {
+  return readJson<OrchestrationRunListResponse>(withRepo("/api/orchestration-runs", repo));
+}
+
+export function fetchOrchestrationRunContent(
+  logFilePath: string,
+  repo?: string
+): Promise<VerificationLogContentResponse> {
+  const query = new URLSearchParams({ path: logFilePath });
+  const pathWithQuery = `/api/orchestration-runs/content?${query.toString()}`;
+  return readJson<VerificationLogContentResponse>(withRepo(pathWithQuery, repo));
 }
 
 export function fetchFileSnapshot(checkpointId: string, filePath: string, repo?: string): Promise<FileSnapshotResponse> {

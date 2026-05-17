@@ -8,6 +8,21 @@ It keeps a private, branch-aware shadow history in `.anvil/` so you can:
 - restore a previous checkpoint
 - export the final state into real Git only when you want to
 
+## What Anvil Can Do Today
+
+Today Anvil already covers five big jobs:
+
+- branch-aware local checkpointing in a private shadow Git history
+- review and restore of AI edits without polluting real Git commits
+- hook-based and watcher-based capture of editor or agent file changes
+- pre-execution safety policy for AI-triggered commands and edits
+- post-checkpoint profile runs and derived insight generation
+
+The important boundary is:
+
+- Anvil is the private working-and-review layer
+- Git is still the final source of truth when you export
+
 ## Mental Model
 
 Anvil has two layers:
@@ -31,7 +46,7 @@ Inside any repo that uses Anvil:
   config.json
   hooks.yaml
   policy.yaml
-  extensions.yaml
+  orchestration.yaml
   metadata.jsonl
   generated-insights.jsonl
   store.git/
@@ -41,7 +56,7 @@ Inside any repo that uses Anvil:
 - `metadata.jsonl` is the append-only checkpoint log
 - `hooks.yaml` is the optional repo-local hook config
 - `policy.yaml` is the optional repo-local execution safety policy
-- `extensions.yaml` registers post-checkpoint analysis apps
+- `orchestration.yaml` controls post-hook and post-checkpoint automation
 - `generated-insights.jsonl` stores structured derived outputs keyed by checkpoint
 - `config.json` also stores retention settings for prune
 - checkpoints are branch-aware
@@ -147,7 +162,7 @@ anvil init
 - `.anvil/store.git`
 - `.anvil/hooks.yaml`
 - `.anvil/policy.yaml`
-- `.anvil/extensions.yaml`
+- `.anvil/orchestration.yaml`
 - `.anvilignore`
 - `.github/hooks/anvil-copilot.json`
 - `.anvil/anvil-execution-guard.mjs`
@@ -156,7 +171,7 @@ anvil init
 
 The Copilot and Codex hooks are installed, but auto-checkpointing stays disabled until you set `autoCheckpoint: true` in `.anvil/hooks.yaml`.
 The shared execution guard is also installed, but it stays inactive until you set `executionGuard.enabled: true` in `.anvil/policy.yaml`.
-Anvil also creates `.anvil/extensions.yaml`, which is where declared post-checkpoint analysis apps are registered.
+Anvil also creates `.anvil/orchestration.yaml`, which is where Anvil-owned post-hook and post-checkpoint automation is configured.
 If `.gitignore` exists, `anvil init` copies it into `.anvilignore` as a starting point so you can customize Anvil-specific ignores from there.
 
 Or skip that and just use any normal Anvil command. Most commands auto-initialize `.anvil/` on first use.
@@ -200,6 +215,11 @@ anvil restore <checkpoint>
 anvil explain <checkpoint>
 anvil assign-branch <checkpoint> [branch]
 anvil export [--preview] [--message "message"]
+anvil watch [--interval-ms 1500] [--debounce-ms 2000]
+anvil run <profile>
+anvil run --command "npm run build" --name build
+anvil verify <profile>
+anvil verify --command "npm run build" --name build
 anvil compact --mode keep-last|squash
 anvil prune [--dry-run] [--max-checkpoints-per-branch 50] [--max-hook-logs 500]
 anvil uninstall
@@ -489,53 +509,104 @@ Important:
 - if multiple files are already dirty, they will be grouped into the same watcher checkpoint
 - stop it with `Ctrl+C`
 
-## Verification
+## Profiles And Runs
 
-Anvil can also run named verification commands against the latest checkpoint on the current branch.
+Anvil can run named profiles against the latest checkpoint on the current branch.
 
 Examples:
 
 ```bash
-anvil verify build
-anvil verify test
-anvil verify lint
-anvil verify --command "npm run build" --name build
+anvil run build
+anvil run test
+anvil run lint
+anvil run --command "npm run build" --name build
 ```
 
 What it does:
-- resolves the named profile from `.anvil/extensions.yaml`
+- resolves the named profile from `.anvil/orchestration.yaml`
 - runs the command in the repo
-- attaches the result to the latest checkpoint as derived verification data
+- attaches the result to the latest checkpoint as derived profile-run data
 - writes the full stdout/stderr log under `.anvil/verification-logs`
 
-Verification config lives in:
+This means a profile run is:
+
+- tied to a checkpoint
+- rerunnable without creating a new checkpoint
+- stored as derived data, not as core checkpoint history
+
+So if you run:
+
+```bash
+anvil run build
+```
+
+Anvil does not create a new checkpoint.
+It takes the latest checkpoint on the current branch, runs the configured command, stores the pass/fail result for that checkpoint, and writes the full log to disk.
+
+Profile config lives in:
 
 ```text
-.anvil/extensions.yaml
+.anvil/orchestration.yaml
 ```
 
 Example:
 
 ```yaml
-verifications:
-  enabled: false
-  profiles:
-    build:
-      command: npm run build
-      autoRun: false
-    test:
-      command: npm test -- --watch=false
-      autoRun: false
-    lint:
-      command: npm run lint
-      autoRun: false
+profiles:
+  build:
+    command: npm run build
+  test:
+    command: npm test -- --watch=false
+  lint:
+    command: npm run lint
+
+lifecycle:
+  aiHooks:
+    copilot:
+      rules: {}
+    codex:
+      rules: {}
+  beforeCheckpoint:
+    rules: {}
+  afterCheckpoint:
+    rules: {}
 ```
 
 Current behavior:
-- manual `anvil verify ...` is implemented
+- manual `anvil run ...` is implemented
 - full logs are stored as separate files under `.anvil/verification-logs/<checkpointId>/`
-- verification results are stored as derived records, not as new checkpoints
-- auto-run policy fields are reserved for the next step
+- profile-run results are stored as derived records, not as new checkpoints
+- reusable profile commands are resolved from the top-level `profiles` section
+
+### How Run Fits Into A Larger Orchestrator
+
+`run` is one part of a bigger project-orchestrator idea, but it is not the whole orchestrator by itself.
+
+Right now the flow is:
+
+1. a hook, watcher, or manual checkpoint records file state
+2. `anvil run ...` runs build, test, or lint against that checkpoint context
+3. Anvil stores the result and the full log as derived output
+
+So today Anvil already has the building blocks for orchestration:
+
+- checkpoint capture
+- profiles
+- generated insights
+- execution safety policy
+
+The missing piece is a higher-level orchestration command that would deliberately chain those steps together for a repo workflow.
+
+You can think of the current split like this:
+
+- `checkpoint`
+  save file state
+- `run`
+  run build/test/lint against a checkpoint
+- `orchestration`
+  coordinate post-hook and post-checkpoint analysis or validation
+- future `orchestrator`
+  coordinate those steps as one repo workflow
 
 ## Execution Safety Guard
 
@@ -646,19 +717,38 @@ Examples:
 
 This layer is for AI-triggered tool execution only in v1. It is not a full shell sandbox for all human terminal commands.
 
-## Post-Checkpoint Extension Apps
+### Codex And Copilot Ask Behavior
 
-Anvil can also run declared review/analysis apps after a checkpoint is already committed.
+Copilot and Codex do not currently behave the same here.
+
+- Copilot can use host-native `ask`
+- Codex `PreToolUse` `ask` is not reliable enough, so strict mode maps ask-level rules to `deny`
+
+That is why `anvil hook status` now reports enforcement mode explicitly, for example:
+
+```text
+executionGuard.enforcementMode: codex: strict (ask -> deny), copilot: host-ask
+```
+
+So the mental model is:
+
+- Anvil still classifies actions internally as `allow`, `ask`, or `deny`
+- Copilot can receive real `ask`
+- Codex may still receive `deny` for ask-level rules when strict mode is enabled
+
+## Orchestration
+
+Anvil can run declared automation after selected hook events or after a checkpoint is already committed.
 
 This is separate from the execution guard:
 - `policy.yaml` controls pre-execution safety
-- `extensions.yaml` registers post-checkpoint apps
+- `orchestration.yaml` registers Anvil-owned post-hook and post-checkpoint automation
 
 ### How It Works
 
-1. Anvil records a checkpoint.
-2. The checkpoint id is queued internally.
-3. Anvil launches enabled extension apps in best-effort background mode.
+1. A hook event or checkpoint event occurs.
+2. Anvil matches any relevant orchestration rule for that phase.
+3. In the current runtime, checkpoint events can launch enabled extension apps in best-effort background mode.
 4. Extension apps receive normalized checkpoint JSON on stdin.
 5. They return structured insight JSON on stdout.
 6. Anvil stores those results in:
@@ -672,59 +762,141 @@ This keeps checkpoint history authoritative while allowing derived outputs like:
 - file-priority suggestions
 - branch health summaries
 
-### Extension Registration
+### Orchestration Registration
 
 `anvil init` creates:
 
 ```text
-.anvil/extensions.yaml
+.anvil/orchestration.yaml
 ```
 
 Starter example:
 
 ```yaml
-extensions:
-  reviewHints:
-    enabled: false
-    command: node .anvil/apps/review-hints.mjs
-    description: "Generate structured checkpoint review hints"
-```
+profiles:
+  build:
+    command: npm run build
 
-### Extension Contract
+lifecycle:
+  aiHooks:
+    copilot:
+      rules:
+        packageScripts:
+          enabled: false
+          mode: background
+          event: PostToolUse
+          includePaths:
+            - package.json
+          actions:
+            - type: runCommand
+              command: npm run build
+    codex:
+      rules: {}
 
-An extension receives stdin like:
+  beforeCheckpoint:
+    rules: {}
 
-```json
-{
-  "version": 1,
-  "repositoryRoot": "C:/path/to/repo",
-  "checkpoint": {
-    "checkpointId": "cp-12",
-    "summary": "Refactor parser",
-    "filesChanged": ["src/parser.ts"]
-  }
-}
-```
-
-It should return stdout like:
-
-```json
-{
-  "insights": [
-    {
-      "type": "review-hint",
-      "title": "Review parser.ts first",
-      "body": "The checkpoint touched parsing logic and may affect downstream validation.",
-      "files": ["src/parser.ts"]
-    }
-  ]
-}
+  afterCheckpoint:
+    rules:
+      appTsBuild:
+        enabled: false
+        mode: background
+        includePaths:
+          - src/app.ts
+        excludePaths:
+          - src/app.spec.ts
+        actions:
+          - type: runProfile
+            profile: build
 ```
 
 Important:
-- extensions are best-effort
-- they do not block checkpoint creation
-- they are intended for review/analysis outputs, not arbitrary execution control
+- `extensions.yaml` is now considered legacy
+- if an older repo still has `.anvil/extensions.yaml` and no `.anvil/orchestration.yaml`, Anvil migrates that config forward when it creates the new orchestration file
+- lifecycle is now the primary control plane:
+  - `lifecycle.aiHooks.<agent>.rules`
+  - `lifecycle.beforeCheckpoint.rules`
+  - `lifecycle.afterCheckpoint.rules`
+- `lifecycle.aiHooks.<agent>.rules` can match:
+  - `event`
+  - `includePaths`
+  - `excludePaths`
+- `lifecycle.beforeCheckpoint.rules` and `lifecycle.afterCheckpoint.rules` can match:
+  - `includePaths`
+  - `excludePaths`
+  - and the checkpoint's `filesChanged` list
+- current lifecycle actions support:
+  - `runCommand`
+  - `runProfile`
+- `mode: blocking` waits for a rule to finish
+- `mode: background` queues it in best-effort mode
+- blocking `beforeCheckpoint` failures prevent checkpoint creation
+- actions run in order and stop on the first failure for that rule
+- hook-triggered and checkpoint-triggered background runs are best-effort and do not block persistence
+
+### Profiles And Actions
+
+`profiles`
+- reusable named commands
+- mainly for build, test, lint, or other validation commands
+- used by:
+  ```yaml
+  - type: runProfile
+    profile: build
+  ```
+
+Example:
+
+```yaml
+profiles:
+  build:
+    command: npm run build
+  test:
+    command: npm test -- --watch=false
+```
+
+`runCommand`
+- runs a trusted command directly
+- good for simple repo automation
+
+Example:
+
+```yaml
+- type: runCommand
+  command: npm run lint
+```
+
+`runProfile`
+- runs one of the named `profiles`
+- stores pass/fail and full logs as profile-run output
+
+Example:
+
+```yaml
+- type: runProfile
+  profile: build
+```
+
+## Project Orchestrator Direction
+
+If you want Anvil to become a repo-level orchestrator, the current architecture already points the right way.
+
+An orchestrator in Anvil should sit above the existing layers:
+
+- hooks or watcher detect work
+- checkpoints record state
+- profiles run build/test/lint
+- policy controls what AI is allowed to execute
+
+So the likely orchestrator job is not "replace run."
+It is "coordinate checkpoint, run profiles, and derived analysis for a project workflow."
+
+In other words:
+
+- `run` answers:
+  "Did this checkpoint build, test, or lint cleanly?"
+- an orchestrator would answer:
+  "Given this repo and this checkpoint, what sequence of validation and follow-up work should run?"
 
 ## Timeline
 
@@ -900,6 +1072,7 @@ The local review UI is designed around:
 - Files Review
 - Checkpoint Details
 - Git Commit Preview
+- Logs
 
 It also supports:
 - summary file review cards
@@ -908,6 +1081,8 @@ It also supports:
 - side-by-side diff
 - collapsible panels
 - repository switching
+- full profile-run log viewing from saved `.anvil/verification-logs` artifacts
+- orchestration run history as its own log surface
 
 ## Development
 

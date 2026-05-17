@@ -1,9 +1,11 @@
 import cors from "cors";
 import express from "express";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CheckpointStore } from "./store.js";
+import type { GeneratedInsightRecord } from "./types.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,6 +40,48 @@ function storeForRequest(request: express.Request): CheckpointStore {
   return new CheckpointStore(resolveRepositoryRoot(requestedRoot));
 }
 
+function normalizeVerificationLogRecord(record: GeneratedInsightRecord) {
+  const metadata = (record.metadata ?? {}) as Record<string, unknown>;
+  const logFilePath = typeof metadata.logFilePath === "string" ? metadata.logFilePath : null;
+  return {
+    checkpointId: record.checkpointId,
+    extensionId: record.extensionId,
+    title: record.title,
+    body: record.body,
+    createdAt: record.createdAt,
+    profile:
+      typeof metadata.profile === "string"
+        ? metadata.profile
+        : record.extensionId.replace(/^verification:/, "").replace(/^profile:/, ""),
+    command: typeof metadata.command === "string" ? metadata.command : "",
+    status: typeof metadata.status === "string" ? metadata.status : "unknown",
+    exitCode: typeof metadata.exitCode === "number" ? metadata.exitCode : null,
+    durationMs: typeof metadata.durationMs === "number" ? metadata.durationMs : null,
+    logFilePath
+  };
+}
+
+function normalizeOrchestrationRunRecord(record: GeneratedInsightRecord) {
+  const metadata = (record.metadata ?? {}) as Record<string, unknown>;
+  const logFilePath = typeof metadata.logFilePath === "string" ? metadata.logFilePath : null;
+  return {
+    checkpointId: record.checkpointId,
+    extensionId: record.extensionId,
+    title: record.title,
+    body: record.body,
+    createdAt: record.createdAt,
+    actionId: typeof metadata.actionId === "string" ? metadata.actionId : record.extensionId.replace(/^orchestration:/, ""),
+    actionType: typeof metadata.actionType === "string" ? metadata.actionType : "unknown",
+    triggerPhase: typeof metadata.triggerPhase === "string" ? metadata.triggerPhase : "unknown",
+    status: typeof metadata.status === "string" ? metadata.status : "unknown",
+    command: typeof metadata.command === "string" ? metadata.command : "",
+    durationMs: typeof metadata.durationMs === "number" ? metadata.durationMs : null,
+    logFilePath,
+    error: typeof metadata.error === "string" ? metadata.error : null,
+    metadata
+  };
+}
+
 app.get("/api/timeline", async (request, response) => {
   const store = storeForRequest(request);
   const timeline = await store.timeline();
@@ -65,6 +109,93 @@ app.get("/api/checkpoints/:id/insights", async (request, response) => {
   const store = storeForRequest(request);
   const insights = await store.generatedInsights(request.params.id);
   response.json({ insights });
+});
+
+app.get("/api/checkpoints/:id/verification-logs", async (request, response) => {
+  const store = storeForRequest(request);
+  const insights = await store.generatedInsights(request.params.id);
+  const logs = insights
+    .filter((item) => item.insightType === "verification" || item.insightType === "profile-run")
+    .map(normalizeVerificationLogRecord)
+    .filter((item) => Boolean(item.logFilePath))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  response.json({ logs });
+});
+
+app.get("/api/orchestration-runs", async (request, response) => {
+  const store = storeForRequest(request);
+  const insights = await store.generatedInsights();
+  const runs = insights
+    .filter((item) => item.insightType === "orchestration-run")
+    .map(normalizeOrchestrationRunRecord)
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  response.json({ runs });
+});
+
+app.get("/api/checkpoints/:id/verification-logs/content", async (request, response) => {
+  const store = storeForRequest(request);
+  const logFilePath = typeof request.query.path === "string" ? request.query.path : "";
+  if (!logFilePath) {
+    response.status(400).send("path is required.");
+    return;
+  }
+
+  const insights = await store.generatedInsights(request.params.id);
+  const allowedPaths = new Set(
+    insights
+      .filter((item) => item.insightType === "verification" || item.insightType === "profile-run")
+      .map(normalizeVerificationLogRecord)
+      .map((item) => item.logFilePath)
+      .filter((item): item is string => Boolean(item))
+  );
+
+  if (!allowedPaths.has(logFilePath)) {
+    response.status(404).send("Verification log not found for this checkpoint.");
+    return;
+  }
+
+  const resolved = path.resolve(logFilePath);
+  const logsRoot = path.resolve(store.baseDir, "verification-logs");
+  if (!resolved.startsWith(logsRoot)) {
+    response.status(400).send("Verification log path is outside the repo log store.");
+    return;
+  }
+
+  const content = await readFile(resolved, "utf8");
+  response.json({ logFilePath: resolved, content });
+});
+
+app.get("/api/orchestration-runs/content", async (request, response) => {
+  const store = storeForRequest(request);
+  const logFilePath = typeof request.query.path === "string" ? request.query.path : "";
+  if (!logFilePath) {
+    response.status(400).send("path is required.");
+    return;
+  }
+
+  const insights = await store.generatedInsights();
+  const allowedPaths = new Set(
+    insights
+      .filter((item) => item.insightType === "orchestration-run")
+      .map(normalizeOrchestrationRunRecord)
+      .map((item) => item.logFilePath)
+      .filter((item): item is string => Boolean(item))
+  );
+
+  if (!allowedPaths.has(logFilePath)) {
+    response.status(404).send("Orchestration log not found for this checkpoint.");
+    return;
+  }
+
+  const resolved = path.resolve(logFilePath);
+  const logsRoot = path.resolve(store.baseDir, "verification-logs");
+  if (!resolved.startsWith(logsRoot)) {
+    response.status(400).send("Orchestration log path is outside the repo log store.");
+    return;
+  }
+
+  const content = await readFile(resolved, "utf8");
+  response.json({ logFilePath: resolved, content });
 });
 
 app.get("/api/checkpoints/:id/file", async (request, response) => {

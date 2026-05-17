@@ -6,6 +6,10 @@ import {
   fetchDiff,
   fetchExportPreview,
   fetchFileSnapshot,
+  fetchOrchestrationRunContent,
+  fetchOrchestrationRuns,
+  fetchVerificationLogContent,
+  fetchVerificationLogs,
   fetchTimeline,
   keepBranches,
   restoreCheckpoint
@@ -19,13 +23,16 @@ import type {
   ParsedDiffFile,
   RepositoryOption,
   SideBySideRow,
-  TimelineItem
+  TimelineItem,
+  OrchestrationRunItem,
+  VerificationLogItem
 } from "./types";
 
 const RECENT_REPOSITORIES_KEY = "anvil.recentRepositories";
 type DiffViewMode = "summary" | "unified" | "side-by-side" | "snapshot";
-type SurfaceMode = "review" | "history" | "manage";
+type SurfaceMode = "review" | "history" | "logs" | "manage";
 type CheckpointDetailTab = "intent" | "files" | "lineage" | "debug";
+type LogsTab = "verification" | "orchestration";
 type SuggestionItem = { title: string; detail: string };
 
 function formatTime(value: string): string {
@@ -174,6 +181,7 @@ export function App() {
   const summaryListRef = useRef<HTMLDivElement | null>(null);
   const summaryCardRefs = useRef<Record<string, HTMLElement | null>>({});
   const [mode, setMode] = useState<SurfaceMode>("review");
+  const [logsTab, setLogsTab] = useState<LogsTab>("verification");
   const [checkpointDetailTab, setCheckpointDetailTab] = useState<CheckpointDetailTab>("intent");
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
   const [branches, setBranches] = useState<BranchSummary[]>([]);
@@ -187,6 +195,13 @@ export function App() {
   const [selectedRepositoryRoot, setSelectedRepositoryRoot] = useState<string>("");
   const [selectedCheckpointId, setSelectedCheckpointId] = useState<string | null>(null);
   const [selectedCheckpoint, setSelectedCheckpoint] = useState<ExplainItem | null>(null);
+  const [verificationLogs, setVerificationLogs] = useState<VerificationLogItem[]>([]);
+  const [selectedVerificationLogPath, setSelectedVerificationLogPath] = useState<string | null>(null);
+  const [selectedVerificationLogContent, setSelectedVerificationLogContent] = useState<string>("");
+  const [orchestrationRuns, setOrchestrationRuns] = useState<OrchestrationRunItem[]>([]);
+  const [selectedOrchestrationRunKey, setSelectedOrchestrationRunKey] = useState<string | null>(null);
+  const [selectedOrchestrationLogPath, setSelectedOrchestrationLogPath] = useState<string | null>(null);
+  const [selectedOrchestrationLogContent, setSelectedOrchestrationLogContent] = useState<string>("");
   const [diffText, setDiffText] = useState<string>("Loading diff...");
   const [parsedFiles, setParsedFiles] = useState<ParsedDiffFile[]>([]);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
@@ -214,12 +229,40 @@ export function App() {
 
   useEffect(() => {
     if (!selectedCheckpointId) {
+      setSelectedCheckpoint(null);
+      setVerificationLogs([]);
+      setSelectedVerificationLogPath(null);
+      setSelectedVerificationLogContent("");
+      setOrchestrationRuns([]);
+      setSelectedOrchestrationRunKey(null);
+      setSelectedOrchestrationLogPath(null);
+      setSelectedOrchestrationLogContent("");
       return;
     }
 
     void loadCheckpoint(selectedCheckpointId);
     void loadDiff(selectedCheckpointId);
+    void loadVerificationLogs(selectedCheckpointId);
+    void loadOrchestrationRuns();
   }, [selectedCheckpointId]);
+
+  useEffect(() => {
+    if (!selectedCheckpointId || !selectedVerificationLogPath) {
+      setSelectedVerificationLogContent("");
+      return;
+    }
+
+    void loadVerificationLogContent(selectedCheckpointId, selectedVerificationLogPath);
+  }, [selectedCheckpointId, selectedVerificationLogPath, selectedRepositoryRoot]);
+
+  useEffect(() => {
+    if (!selectedCheckpointId || !selectedOrchestrationLogPath) {
+      setSelectedOrchestrationLogContent("");
+      return;
+    }
+
+    void loadOrchestrationLogContent(selectedCheckpointId, selectedOrchestrationLogPath);
+  }, [selectedCheckpointId, selectedOrchestrationLogPath, selectedRepositoryRoot]);
 
   useEffect(() => {
     if (diffViewMode !== "snapshot" || !selectedCheckpointId || !selectedFilePath) {
@@ -291,6 +334,86 @@ export function App() {
       const checkpoint = await fetchCheckpoint(checkpointId, selectedRepositoryRoot || undefined);
       setSelectedCheckpoint(checkpoint);
     } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  }
+
+  async function loadVerificationLogs(checkpointId: string) {
+    try {
+      const response = await fetchVerificationLogs(checkpointId, selectedRepositoryRoot || undefined);
+      setVerificationLogs(response.logs);
+      setSelectedVerificationLogPath((current) => {
+        if (response.logs.length === 0) {
+          return null;
+        }
+
+        if (current && response.logs.some((log) => log.logFilePath === current)) {
+          return current;
+        }
+
+        return response.logs[0].logFilePath;
+      });
+    } catch (loadError) {
+      setVerificationLogs([]);
+      setSelectedVerificationLogPath(null);
+      setSelectedVerificationLogContent("");
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  }
+
+  async function loadOrchestrationRuns() {
+    try {
+      const response = await fetchOrchestrationRuns(selectedRepositoryRoot || undefined);
+      setOrchestrationRuns(response.runs);
+      setSelectedOrchestrationRunKey((current) => {
+        if (response.runs.length === 0) {
+          return null;
+        }
+
+        const currentStillExists = current && response.runs.some((run, index) => `${run.extensionId}:${run.createdAt}:${index}` === current);
+        if (currentStillExists) {
+          return current;
+        }
+
+        return `${response.runs[0].extensionId}:${response.runs[0].createdAt}:0`;
+      });
+      setSelectedOrchestrationLogPath((current) => {
+        const withLogs = response.runs.filter((run) => Boolean(run.logFilePath));
+        if (withLogs.length === 0) {
+          return null;
+        }
+
+        if (current && withLogs.some((run) => run.logFilePath === current)) {
+          return current;
+        }
+
+        return withLogs[0].logFilePath;
+      });
+    } catch (loadError) {
+      setOrchestrationRuns([]);
+      setSelectedOrchestrationRunKey(null);
+      setSelectedOrchestrationLogPath(null);
+      setSelectedOrchestrationLogContent("");
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  }
+
+  async function loadVerificationLogContent(checkpointId: string, logFilePath: string) {
+    try {
+      const response = await fetchVerificationLogContent(checkpointId, logFilePath, selectedRepositoryRoot || undefined);
+      setSelectedVerificationLogContent(response.content);
+    } catch (loadError) {
+      setSelectedVerificationLogContent("");
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  }
+
+  async function loadOrchestrationLogContent(_checkpointId: string, logFilePath: string) {
+    try {
+      const response = await fetchOrchestrationRunContent(logFilePath, selectedRepositoryRoot || undefined);
+      setSelectedOrchestrationLogContent(response.content);
+    } catch (loadError) {
+      setSelectedOrchestrationLogContent("");
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     }
   }
@@ -369,6 +492,9 @@ export function App() {
     setError(null);
     setSelectedCheckpoint(null);
     setSelectedCheckpointId(null);
+    setVerificationLogs([]);
+    setSelectedVerificationLogPath(null);
+    setSelectedVerificationLogContent("");
     setParsedFiles([]);
     setSelectedFilePath(null);
     setFileSnapshot(null);
@@ -436,6 +562,12 @@ export function App() {
     .filter(([, selected]) => selected)
     .map(([branch]) => branch);
 
+  const selectedVerificationLog =
+    verificationLogs.find((log) => log.logFilePath === selectedVerificationLogPath) ?? null;
+  const selectedOrchestrationRun =
+    orchestrationRuns.find((run, index) => `${run.extensionId}:${run.createdAt}:${index}` === selectedOrchestrationRunKey) ??
+    orchestrationRuns[0] ??
+    null;
   const selectedFile = parsedFiles.find((file) => file.filePath === selectedFilePath) ?? null;
   const visibleFilePaths =
     parsedFiles.length > 0
@@ -1159,6 +1291,209 @@ export function App() {
     );
   }
 
+  function renderLogsMode() {
+    return (
+      <section className="mode-layout logs-layout">
+        <section className="card mode-panel history-timeline-panel">
+          <div className="section-heading">
+            <h2>Checkpoint Timeline</h2>
+            <span>{timeline.length} checkpoint{timeline.length === 1 ? "" : "s"}</span>
+          </div>
+          {timeline.length > 0 ? (
+            <div className="timeline-list">
+              {timeline.map((item) => (
+                <button
+                  key={item.checkpointId}
+                  className={`timeline-item${selectedCheckpointId === item.checkpointId ? " active" : ""}`}
+                  onClick={() => setSelectedCheckpointId(item.checkpointId)}
+                  type="button"
+                >
+                  <div className="timeline-item-top">
+                    <strong>{item.checkpointId}</strong>
+                    <span>{formatTime(item.timestamp)}</span>
+                  </div>
+                  <div className="timeline-summary">{item.summary}</div>
+                  <div className="timeline-meta">{item.filesChanged.length} file{item.filesChanged.length === 1 ? "" : "s"}</div>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-state">
+              <strong>No checkpoints yet</strong>
+              <p>Record a checkpoint first, then profile runs can attach to it.</p>
+            </div>
+          )}
+        </section>
+
+        <section className="card mode-panel logs-list-panel">
+          <div className="section-heading">
+            <h2>{logsTab === "verification" ? "Profile Runs" : "Orchestration Runs"}</h2>
+            <span>
+              {logsTab === "verification"
+                ? `${verificationLogs.length} run${verificationLogs.length === 1 ? "" : "s"}`
+                : `${orchestrationRuns.length} run${orchestrationRuns.length === 1 ? "" : "s"}`}
+            </span>
+          </div>
+          <div className="checkpoint-detail-tabs logs-subtabs">
+            <button
+              className={`checkpoint-detail-tab${logsTab === "verification" ? " active" : ""}`}
+              onClick={() => setLogsTab("verification")}
+              type="button"
+            >
+              Profiles
+            </button>
+            <button
+              className={`checkpoint-detail-tab${logsTab === "orchestration" ? " active" : ""}`}
+              onClick={() => setLogsTab("orchestration")}
+              type="button"
+            >
+              Orchestration
+            </button>
+          </div>
+          {selectedCheckpoint ? (
+            <div className="logs-checkpoint-summary">
+              <span className="label">Selected Checkpoint</span>
+              <strong>{selectedCheckpoint.checkpointId}</strong>
+              <p>{selectedCheckpoint.summary}</p>
+            </div>
+          ) : null}
+          {logsTab === "verification" && verificationLogs.length > 0 ? (
+            <div className="log-list">
+              {verificationLogs.map((log) => (
+                <button
+                  key={log.logFilePath}
+                  className={`log-entry${selectedVerificationLogPath === log.logFilePath ? " active" : ""}`}
+                  onClick={() => setSelectedVerificationLogPath(log.logFilePath)}
+                  type="button"
+                >
+                  <div className="log-entry-top">
+                    <strong>{log.title}</strong>
+                    <span className={`detail-chip log-status-chip log-status-${log.status}`}>{log.status}</span>
+                  </div>
+                  <div className="log-entry-meta">
+                    <span>{log.profile}</span>
+                    <span>{formatTime(log.createdAt)}</span>
+                    {log.durationMs !== null ? <span>{log.durationMs}ms</span> : null}
+                  </div>
+                  <div className="mono log-command">{log.command}</div>
+                  <p className="log-summary">{log.body}</p>
+                </button>
+              ))}
+            </div>
+          ) : logsTab === "verification" ? (
+            <div className="empty-state">
+              <strong>No profile runs</strong>
+              <p>Run <span className="mono">anvil run build</span>, <span className="mono">anvil run test</span>, or another configured profile to populate this view.</p>
+            </div>
+          ) : orchestrationRuns.length > 0 ? (
+            <div className="log-list">
+              {orchestrationRuns.map((run, index) => (
+                <button
+                  key={`${run.extensionId}-${run.createdAt}-${index}`}
+                  className={`log-entry${selectedOrchestrationRunKey === `${run.extensionId}:${run.createdAt}:${index}` ? " active" : ""}`}
+                  onClick={() => {
+                    setSelectedOrchestrationRunKey(`${run.extensionId}:${run.createdAt}:${index}`);
+                    setSelectedOrchestrationLogPath(run.logFilePath);
+                  }}
+                  type="button"
+                >
+                  <div className="log-entry-top">
+                    <strong>{run.title}</strong>
+                    <span className={`detail-chip log-status-chip log-status-${run.status}`}>{run.status}</span>
+                  </div>
+                  <div className="log-entry-meta">
+                    <span>{run.actionType}</span>
+                    <span>{run.triggerPhase}</span>
+                    <span>{run.checkpointId}</span>
+                    <span>{formatTime(run.createdAt)}</span>
+                    {run.durationMs !== null ? <span>{run.durationMs}ms</span> : null}
+                  </div>
+                  <div className="mono log-command">{run.command || run.actionId}</div>
+                  <p className="log-summary">{run.body}</p>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-state">
+              <strong>No orchestration runs</strong>
+              <p>Run a profile or trigger an enabled orchestration rule to populate this view.</p>
+            </div>
+          )}
+        </section>
+
+        <section className="card mode-panel log-viewer-panel">
+          <div className="section-heading">
+            <h2>Full Log</h2>
+            {logsTab === "verification"
+              ? selectedVerificationLog
+                ? <span>{selectedVerificationLog.profile}</span>
+                : <span>No log selected</span>
+              : selectedOrchestrationRun
+                ? <span>{selectedOrchestrationRun.actionId}</span>
+                : <span>No run selected</span>}
+          </div>
+          {logsTab === "verification" && selectedVerificationLog ? (
+            <div className="log-viewer-stack">
+              <div className="detail-grid">
+                <div>
+                  <span className="label">Command</span>
+                  <div className="mono">{selectedVerificationLog.command}</div>
+                </div>
+                <div>
+                  <span className="label">Saved Log File</span>
+                  <div className="mono">{selectedVerificationLog.logFilePath}</div>
+                </div>
+              </div>
+              <pre className="log-viewer-pre">{selectedVerificationLogContent || "Loading log..."}</pre>
+            </div>
+          ) : logsTab === "verification" ? (
+            <div className="empty-state">
+              <strong>No profile run selected</strong>
+              <p>Select a profile run to inspect the saved full log content from <span className="mono">.anvil/verification-logs</span>.</p>
+            </div>
+          ) : selectedOrchestrationRun ? (
+            <div className="log-viewer-stack">
+              <div className="detail-grid">
+                <div>
+                  <span className="label">Action</span>
+                  <div className="mono">{selectedOrchestrationRun.actionType}</div>
+                </div>
+                <div>
+                  <span className="label">Trigger Phase</span>
+                  <div>{selectedOrchestrationRun.triggerPhase}</div>
+                </div>
+                <div>
+                  <span className="label">Command</span>
+                  <div className="mono">{selectedOrchestrationRun.command || "No command recorded"}</div>
+                </div>
+                <div>
+                  <span className="label">Saved Log File</span>
+                  <div className="mono">{selectedOrchestrationRun.logFilePath ?? "No log file recorded"}</div>
+                </div>
+                {selectedOrchestrationRun.error ? (
+                  <div className="detail-section-wide">
+                    <span className="label">Error</span>
+                    <div>{selectedOrchestrationRun.error}</div>
+                  </div>
+                ) : null}
+              </div>
+              <pre className="log-viewer-pre">
+                {selectedOrchestrationRun.logFilePath
+                  ? selectedOrchestrationLogContent || "Loading log..."
+                  : "This orchestration run did not create a full log artifact."}
+              </pre>
+            </div>
+          ) : (
+            <div className="empty-state">
+              <strong>No orchestration run selected</strong>
+              <p>Select an orchestration run to inspect its audit details and saved log content.</p>
+            </div>
+          )}
+        </section>
+      </section>
+    );
+  }
+
   return (
     <div className="surface-shell">
       <main className="surface-main">
@@ -1244,6 +1579,7 @@ export function App() {
           {[
             ["review", "Review"],
             ["history", "History"],
+            ["logs", "Logs"],
             ["manage", "Manage"]
           ].map(([value, label]) => (
             <button
@@ -1261,20 +1597,24 @@ export function App() {
 
         <section className="mode-bar card">
           <div className="mode-title-block">
-            <strong>{mode === "review" ? "Review" : mode === "history" ? "History" : "Manage"}</strong>
+            <strong>
+              {mode === "review" ? "Review" : mode === "history" ? "History" : mode === "logs" ? "Logs" : "Manage"}
+            </strong>
             <span className="panel-subtitle">
               {mode === "review"
                 ? "Focus on current branch changes, file review, restore, and Git export."
                 : mode === "history"
                   ? "Browse branch-local checkpoints, inspect diffs, and understand how you got here."
-                  : "Manage shadow branches and other Anvil maintenance tasks."}
+                  : mode === "logs"
+                    ? "Inspect profile runs and open the full saved build, test, and lint logs."
+                    : "Manage shadow branches and other Anvil maintenance tasks."}
             </span>
           </div>
           <div className="diff-toolbar">
             <div className="toolbar-chip">{repositoryName}</div>
             <div className="toolbar-chip">Branch {currentBranch ?? "unknown"}</div>
             <div className="toolbar-chip">{reviewFiles.length} changed files</div>
-            {mode !== "manage" && diffViewMode !== "summary" ? (
+            {mode !== "manage" && mode !== "logs" && diffViewMode !== "summary" ? (
               <button
                 onClick={() => {
                   setDiffViewMode("summary");
@@ -1285,7 +1625,7 @@ export function App() {
                 Back to Summary
               </button>
             ) : null}
-            {mode !== "manage" ? (
+            {mode !== "manage" && mode !== "logs" ? (
               <select value={diffViewMode} onChange={(event) => setDiffViewMode(event.target.value as DiffViewMode)}>
                 <option value="summary">Summary view</option>
                 <option value="unified">Unified diff</option>
@@ -1296,7 +1636,13 @@ export function App() {
           </div>
         </section>
 
-        {mode === "review" ? renderReviewMode() : mode === "history" ? renderHistoryMode() : renderManageMode()}
+        {mode === "review"
+          ? renderReviewMode()
+          : mode === "history"
+            ? renderHistoryMode()
+            : mode === "logs"
+              ? renderLogsMode()
+              : renderManageMode()}
       </main>
     </div>
   );
