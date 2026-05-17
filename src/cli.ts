@@ -584,7 +584,9 @@ async function printHookStatus(
   console.log(
     `  ${formatStatusLine(
       "executionGuard.enforcementMode",
-      policy.askAsDeny ? "strict (ask rules enforced as deny)" : "host-ask"
+      policy.askAsDeny
+        ? "codex: strict (ask -> deny), copilot: host-ask"
+        : "codex: host-ask, copilot: host-ask"
     )}`
   );
   console.log("");
@@ -824,17 +826,17 @@ async function main(): Promise<void> {
 
       const explanation = `${evaluation.category}: ${evaluation.reason}`;
       const additionalContext = `${evaluation.reason} ${evaluation.nextStep}`.trim();
-      const externalDecision =
-        evaluation.decision === "ask" && policy.askAsDeny
-          ? "deny"
-          : evaluation.decision;
-
       if (vscodeHookMode) {
-        emitVSCodeGuardDecision(externalDecision, explanation, additionalContext);
+        emitVSCodeGuardDecision(evaluation.decision, explanation, additionalContext);
         return;
       }
 
       if (codexHookMode) {
+        const codexExternalDecision =
+          evaluation.decision === "ask" && policy.askAsDeny
+            ? "deny"
+            : evaluation.decision;
+
         if (isCodexPermissionRequest) {
           if (evaluation.decision === "deny") {
             emitCodexPermissionRequestDecision("deny", evaluation.reason);
@@ -848,7 +850,7 @@ async function main(): Promise<void> {
           return;
         }
 
-        emitCodexGuardDecision(externalDecision, explanation, additionalContext);
+        emitCodexGuardDecision(codexExternalDecision, explanation, additionalContext);
         return;
       }
 
