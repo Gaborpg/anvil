@@ -435,7 +435,10 @@ export async function ensureExecutionGuardScript(repositoryRoot: string): Promis
   await mkdir(path.dirname(filePath), { recursive: true });
   const cliEntrypoint = process.argv[1] ? path.resolve(process.argv[1]) : "";
   const nodeExecutable = process.execPath;
+  const debugPath = path.join(repositoryRoot, ".anvil", "execution-guard-debug.json");
   const content = `import { spawnSync } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -450,12 +453,35 @@ function readStdin() {
   });
 }
 
-const hostIndex = process.argv.indexOf("--host");
-const host = hostIndex >= 0 && process.argv[hostIndex + 1] ? process.argv[hostIndex + 1] : "codex";
-const rawInput = await readStdin();
-const modeFlag = host === "copilot" ? "--vscode-hook" : "--codex-hook";
+  const hostIndex = process.argv.indexOf("--host");
+  const host = hostIndex >= 0 && process.argv[hostIndex + 1] ? process.argv[hostIndex + 1] : "codex";
+  const rawInput = await readStdin();
+  const debugTarget = ${JSON.stringify(debugPath)};
+  await mkdir(path.dirname(debugTarget), { recursive: true });
+  await writeFile(
+    debugTarget,
+    JSON.stringify(
+      {
+        timestamp: new Date().toISOString(),
+        cwd: process.cwd(),
+        host,
+        argv: process.argv.slice(2),
+        rawInput
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+  const modeFlag =
+    host === "copilot-cli" || host === "copilot"
+      ? "--copilot-cli-hook"
+    : host === "copilot-vs"
+      ? "--copilot-vs-hook"
+      : "--codex-hook";
+const extraArgs = process.argv.includes("--permission-request") ? ["--permission-request"] : [];
 
-const result = spawnSync(${JSON.stringify(nodeExecutable)}, [${JSON.stringify(cliEntrypoint)}, "guard", "evaluate", modeFlag], {
+const result = spawnSync(${JSON.stringify(nodeExecutable)}, [${JSON.stringify(cliEntrypoint)}, "guard", "evaluate", modeFlag, ...extraArgs], {
   cwd: process.cwd(),
   input: rawInput,
   encoding: "utf8",
@@ -481,6 +507,30 @@ function matchesCommandPrefix(command: string, candidates: string[]): string | n
     const normalizedCandidate = normalizeCommandValue(candidate);
     if (normalizedCandidate && (command === normalizedCandidate || command.startsWith(`${normalizedCandidate} `))) {
       return candidate;
+    }
+  }
+
+  return null;
+}
+
+function commandSegments(command: string): string[] {
+  return command
+    .split(/(?:&&|\|\||;|\r?\n)/)
+    .map((segment) => normalizeCommandValue(segment))
+    .filter(Boolean);
+}
+
+function matchCommandAcrossSegments(command: string, candidates: string[]): string | null {
+  const normalizedCommand = normalizeCommandValue(command);
+  const directMatch = matchesCommandPrefix(normalizedCommand, candidates);
+  if (directMatch) {
+    return directMatch;
+  }
+
+  for (const segment of commandSegments(normalizedCommand)) {
+    const segmentMatch = matchesCommandPrefix(segment, candidates);
+    if (segmentMatch) {
+      return segmentMatch;
     }
   }
 
@@ -580,7 +630,7 @@ function classifyShellCommand(command: string, policy: ExecutionGuardPolicy): Gu
     };
   }
 
-  const denyMatch = matchesCommandPrefix(normalizedCommand, policy.denyCommands);
+  const denyMatch = matchCommandAcrossSegments(normalizedCommand, policy.denyCommands);
   if (denyMatch) {
     let category: GuardEvaluationResult["category"] = "destructive-filesystem";
     if (normalizeCommandValue(denyMatch).startsWith("git ")) {
@@ -625,7 +675,7 @@ function classifyShellCommand(command: string, policy: ExecutionGuardPolicy): Gu
     }
   }
 
-  const testMatch = matchesCommandPrefix(normalizedCommand, policy.allowedTestCommands);
+  const testMatch = matchCommandAcrossSegments(normalizedCommand, policy.allowedTestCommands);
   if (testMatch) {
     return {
       decision: "allow",
@@ -635,7 +685,7 @@ function classifyShellCommand(command: string, policy: ExecutionGuardPolicy): Gu
     };
   }
 
-  const buildMatch = matchesCommandPrefix(normalizedCommand, policy.allowedBuildCommands);
+  const buildMatch = matchCommandAcrossSegments(normalizedCommand, policy.allowedBuildCommands);
   if (buildMatch) {
     return {
       decision: "allow",
@@ -645,7 +695,7 @@ function classifyShellCommand(command: string, policy: ExecutionGuardPolicy): Gu
     };
   }
 
-  const askMatch = matchesCommandPrefix(normalizedCommand, policy.askCommands);
+  const askMatch = matchCommandAcrossSegments(normalizedCommand, policy.askCommands);
   if (askMatch) {
     let category: GuardEvaluationResult["category"] = "shell";
     if (

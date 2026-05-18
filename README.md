@@ -155,6 +155,22 @@ Initialize Anvil explicitly:
 anvil init
 ```
 
+Or install only the hook family you actually want:
+
+```bash
+anvil init --hooks codex
+anvil init --hooks copilot-cli
+anvil init --hooks copilot-vs,codex
+```
+
+You can also use explicit flags:
+
+```bash
+anvil init --codex
+anvil init --copilot-cli
+anvil init --copilot-vs
+```
+
 `anvil init` now bootstraps all the basic repo-local Anvil wiring:
 - `.anvil/config.json`
 - `.anvil/metadata.jsonl`
@@ -164,12 +180,17 @@ anvil init
 - `.anvil/policy.yaml`
 - `.anvil/orchestration.yaml`
 - `.anvilignore`
-- `.github/hooks/anvil-copilot.json`
 - `.anvil/anvil-execution-guard.mjs`
-- `.codex/anvil-codex-after-edit.mjs`
-- `.codex/hooks.json`
+- selected hook files only:
+  - `.github/hooks/anvil-copilot-vs.json`
+  - `.github/hooks/anvil-copilot-cli.json`
+  - `.codex/anvil-codex-after-edit.mjs`
+  - `.codex/hooks.json`
 
-The Copilot and Codex hooks are installed, but auto-checkpointing stays disabled until you set `autoCheckpoint: true` in `.anvil/hooks.yaml`.
+By default, `anvil init` installs all supported hook families.
+If you pass `--hooks` or one of the explicit hook flags, Anvil only installs the selected hook files so you do not end up with repo files you do not need.
+
+Any installed hook family still keeps auto-checkpointing disabled until you set `autoCheckpoint: true` in `.anvil/hooks.yaml`.
 The shared execution guard is also installed, but it stays inactive until you set `executionGuard.enabled: true` in `.anvil/policy.yaml`.
 Anvil also creates `.anvil/orchestration.yaml`, which is where Anvil-owned post-hook and post-checkpoint automation is configured.
 If `.gitignore` exists, `anvil init` copies it into `.anvilignore` as a starting point so you can customize Anvil-specific ignores from there.
@@ -200,9 +221,11 @@ anvil review --port 4313
 
 ```bash
 anvil init
-anvil install-codex-hook
 anvil install-copilot-hook
-anvil guard evaluate [--vscode-hook|--codex-hook]
+anvil install-copilot-vs-hook
+anvil install-copilot-cli-hook
+anvil install-codex-hook
+anvil guard evaluate [--copilot-vs-hook|--copilot-cli-hook|--copilot-hook|--vscode-hook|--codex-hook]
 anvil repair-baseline
 anvil review [--port 4312]
 anvil checkpoint --summary "Updated parser logic"
@@ -333,15 +356,48 @@ Important:
 - rules are evaluated in order, so later rules can override earlier ones
 - Anvil's own built-in internal files are still always ignored
 
-## Copilot Auto-Checkpoint Hook
+## Copilot VS Auto-Checkpoint Hook
 
-VS Code Copilot hooks use workspace JSON files under:
+The legacy VS-compatible Copilot setup uses:
+
+```text
+.github/hooks/anvil-copilot-vs.json
+```
+
+Install or refresh it with:
+
+```bash
+anvil install-copilot-vs-hook
+```
+
+`anvil install-copilot-hook` is kept as a compatibility alias and currently refreshes this Copilot VS setup.
+
+Enable it in `.anvil/hooks.yaml` with:
+
+```yaml
+copilotVs:
+  autoCheckpoint: true
+  summary: "Copilot VS file changes"
+  kind: after_edit_batch
+  command: copilot-vs
+  testStatus: unknown
+```
+
+It calls:
+
+```bash
+anvil hook copilot-after-edit --copilot-vs-hook
+```
+
+## Copilot CLI Auto-Checkpoint Hook
+
+Copilot CLI discovers repo-local JSON hook files under:
 
 ```text
 .github/hooks/
 ```
 
-Install or refresh Anvil's VS Code Copilot hook file into the current repo:
+Install or refresh Anvil's Copilot CLI hook file into the current repo:
 
 ```bash
 anvil install-copilot-hook
@@ -352,23 +408,40 @@ anvil install-copilot-hook
 That creates:
 
 ```text
-.github/hooks/anvil-copilot.json
+.github/hooks/anvil-copilot-cli.json
 ```
 
-The installed hook calls:
+The installed hook file is a Copilot CLI `version: 1` hook config that registers:
+
+- `PreToolUse`
+- `PermissionRequest`
+- `UserPromptSubmit`
+- `PostToolUse`
+
+and points them at Anvil's repo-local wrappers and guard scripts with explicit `powershell`, `bash`, `cwd`, and `timeoutSec` fields.
+
+The repo-local pieces it installs are:
+
+- `.anvil/anvil-execution-guard.mjs`
+- `.anvil/anvil-copilot-cli-prompt-submit.mjs`
+- `.anvil/anvil-copilot-cli-after-edit.mjs`
+
+The after-edit wrapper is important. It normalizes Copilot CLI `postToolUse` edit payloads before forwarding them into Anvil's checkpoint path, which keeps Copilot CLI checkpoint recording much closer to the Codex flow.
+
+The post-edit hook calls:
 
 ```bash
-anvil hook copilot-after-edit --vscode-hook
+node .anvil/anvil-copilot-cli-after-edit.mjs
 ```
 
 Anvil still keeps the actual auto-checkpoint behavior disabled by default. To opt in, enable the repo-local Anvil hook config:
 
 ```yaml
-copilot:
+copilotCli:
   autoCheckpoint: true
   summary: "Copilot file changes"
   kind: after_edit_batch
-  command: copilot
+  command: copilot-cli
   testStatus: unknown
 ```
 
@@ -378,7 +451,7 @@ Save that as:
 .anvil/hooks.yaml
 ```
 
-Then have your Copilot post-edit hook call:
+Then have your Copilot CLI post-edit hook call:
 
 ```bash
 anvil hook copilot-after-edit
@@ -391,7 +464,9 @@ anvil hook copilot-after-edit --summary "Copilot refactor" --command "copilot" -
 ```
 
 Important:
-- VS Code discovers the workspace hook from `.github/hooks/anvil-copilot.json`
+- Copilot CLI discovers the repo hook from `.github/hooks/anvil-copilot-cli.json`
+- on Windows, Copilot CLI hooks require PowerShell 7+ (`pwsh`) to be available on `PATH`
+- `anvil init`, `anvil install-copilot-cli-hook`, and `anvil hook status` will warn if `pwsh` is missing
 - this hook is disabled unless `.anvil/hooks.yaml` explicitly enables it
 - if there are no file changes, Anvil will skip the checkpoint
 - this creates an Anvil checkpoint, not a real Git commit
@@ -476,8 +551,10 @@ This reports:
 - launched-from folder if different
 - current branch
 - whether `.anvil/hooks.yaml` exists
-- whether Copilot and Codex auto-checkpointing are enabled
-- whether `.github/hooks/anvil-copilot.json` exists
+- whether Copilot VS, Copilot CLI, and Codex auto-checkpointing are enabled
+- whether Copilot CLI prerequisites like `pwsh` are available
+- whether `.github/hooks/anvil-copilot-vs.json` exists
+- whether `.github/hooks/anvil-copilot-cli.json` exists
 - whether `.codex/hooks.json` exists
 - whether `.anvilignore` exists
 - the last recorded hook execution, including whether it was ignored, disabled, had no changes, or created a checkpoint
@@ -562,7 +639,9 @@ profiles:
 
 lifecycle:
   aiHooks:
-    copilot:
+    copilotVs:
+      rules: {}
+    copilotCli:
       rules: {}
     codex:
       rules: {}
@@ -621,12 +700,13 @@ What it is:
   ```text
   .anvil/policy.yaml
   ```
-- Codex and Copilot pre-tool hooks both call the same guard
+- Codex, Copilot VS, and Copilot CLI pre-tool hooks all call the same guard
 
 The guard is installed by:
 - `anvil init`
 - `anvil install-codex-hook`
-- `anvil install-copilot-hook`
+- `anvil install-copilot-vs-hook`
+- `anvil install-copilot-cli-hook`
 
 But it is disabled by default. To enable it:
 
@@ -719,21 +799,23 @@ This layer is for AI-triggered tool execution only in v1. It is not a full shell
 
 ### Codex And Copilot Ask Behavior
 
-Copilot and Codex do not currently behave the same here.
+Copilot VS, Copilot CLI, and Codex do not currently behave the same here.
 
-- Copilot can use host-native `ask`
+- Copilot VS can use host-native `ask`
+- Copilot CLI can use host-native `ask`
 - Codex `PreToolUse` `ask` is not reliable enough, so strict mode maps ask-level rules to `deny`
 
 That is why `anvil hook status` now reports enforcement mode explicitly, for example:
 
 ```text
-executionGuard.enforcementMode: codex: strict (ask -> deny), copilot: host-ask
+executionGuard.enforcementMode: codex: strict (ask -> deny), copilotVs: host-ask, copilotCli: host-ask
 ```
 
 So the mental model is:
 
 - Anvil still classifies actions internally as `allow`, `ask`, or `deny`
-- Copilot can receive real `ask`
+- Copilot VS can receive real `ask`
+- Copilot CLI can receive real `ask`
 - Codex may still receive `deny` for ask-level rules when strict mode is enabled
 
 ## Orchestration
@@ -779,7 +861,9 @@ profiles:
 
 lifecycle:
   aiHooks:
-    copilot:
+    copilotVs:
+      rules: {}
+    copilotCli:
       rules:
         packageScripts:
           enabled: false

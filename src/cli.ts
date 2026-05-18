@@ -10,10 +10,11 @@ import { promisify } from "node:util";
 import {
   appendHookExecutionLog,
   clearPendingCopilotPrompt,
+  clearPendingCopilotCliPrompt,
   clearPendingCodexPrompt,
-  copilotPromptWrapperPath,
-  copilotPendingPromptPath,
+  copilotCliPromptWrapperPath,
   type CodexHookInput,
+  copilotCliHookConfigPath,
   codexHookConfigPath,
   codexPromptWrapperPath,
   ensureHookConfigTemplate,
@@ -26,17 +27,20 @@ import {
   extractVSCodeHookRationale,
   hookConfigPath,
   installCodexHook,
-  installVSCodeCopilotHook,
+  installCopilotCliHook,
+  installCopilotVsHook,
   isCodexFileEditEvent,
   isCopilotPromptSubmitEvent,
   isCodexPromptSubmitEvent,
   isCopilotFileEditEvent,
   loadHookConfig,
   readPendingCopilotPrompt,
+  readPendingCopilotCliPrompt,
   readPendingCodexPrompt,
   readLastHookExecutionLog,
   hookWrapperErrorLogPath,
   writePendingCopilotPrompt,
+  writePendingCopilotCliPrompt,
   writePendingCodexPrompt,
   vscodeCopilotHookConfigPath,
   type VSCodeHookInput
@@ -87,18 +91,20 @@ function printHelp(): void {
   console.log(`anvil
 
 Usage:
-  anvil init
+  anvil init [--hooks codex|copilot-vs|copilot-cli[,..]] [--codex] [--copilot-vs] [--copilot-cli]
   anvil install -g
-  anvil install-codex-hook
   anvil install-copilot-hook
-  anvil guard evaluate [--vscode-hook|--codex-hook]
+  anvil install-copilot-vs-hook
+  anvil install-copilot-cli-hook
+  anvil install-codex-hook
+  anvil guard evaluate [--copilot-vs-hook|--copilot-cli-hook|--copilot-hook|--vscode-hook|--codex-hook]
   anvil repair-baseline
   anvil uninstall
   anvil uninstall -g
   anvil compact --mode keep-last|squash
   anvil prune [--dry-run] [--max-checkpoints-per-branch 50] [--max-hook-logs 500]
-  anvil hook copilot-prompt-submit [--prompt "..."] [--rationale "..."] [--vscode-hook]
-  anvil hook copilot-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "copilot"] [--rationale "..."] [--test-status passed|failed|unknown] [--vscode-hook]
+  anvil hook copilot-prompt-submit [--prompt "..."] [--rationale "..."] [--copilot-vs-hook|--copilot-cli-hook]
+  anvil hook copilot-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "copilot"] [--rationale "..."] [--test-status passed|failed|unknown] [--copilot-vs-hook|--copilot-cli-hook]
   anvil hook codex-after-edit [--summary "summary"] [--kind after_edit_batch] [--command "codex"] [--rationale "..."] [--test-status passed|failed|unknown] [--codex-hook]
   anvil hook status
   anvil hook doctor
@@ -141,23 +147,150 @@ function parsePathList(value: string | null): string[] {
     .filter(Boolean);
 }
 
-function extractVSCodeGuardCommand(input: VSCodeHookInput | null): string | null {
-  if (!input?.tool_input || typeof input.tool_input !== "object") {
+function extractNestedCommandString(value: unknown, depth = 0): string | null {
+  if (depth > 3 || value == null) {
     return null;
   }
 
-  const toolInput = input.tool_input as Record<string, unknown>;
-  const candidates = [
-    toolInput.command,
-    toolInput.cmd,
-    toolInput.script,
-    toolInput.args,
-    toolInput.arguments
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    if (
+      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    ) {
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        const extracted = extractNestedCommandString(parsed, depth + 1);
+        if (extracted) {
+          return extracted;
+        }
+      } catch {
+        // Fall through and treat the raw string as a command-like value.
+      }
+    }
+
+    return trimmed;
+  }
+
+  if (Array.isArray(value)) {
+    const stringParts = value
+      .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      .map((item) => item.trim());
+    if (stringParts.length > 0) {
+      return stringParts.join(" ");
+    }
+
+    for (const item of value) {
+      const extracted = extractNestedCommandString(item, depth + 1);
+      if (extracted) {
+        return extracted;
+      }
+    }
+    return null;
+  }
+
+  if (typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const preferredKeys = [
+    "command",
+    "commandLine",
+    "command_line",
+    "cmd",
+    "script",
+    "input",
+    "text",
+    "args",
+    "arguments",
+    "commandText",
+    "command_text"
+  ];
+
+  for (const key of preferredKeys) {
+    const extracted = extractNestedCommandString(record[key], depth + 1);
+    if (extracted) {
+      return extracted;
+    }
+  }
+
+  for (const nestedValue of Object.values(record)) {
+    const extracted = extractNestedCommandString(nestedValue, depth + 1);
+    if (extracted) {
+      return extracted;
+    }
+  }
+
+  return null;
+}
+
+type InitHookTarget = "copilot-vs" | "copilot-cli" | "codex";
+
+function parseInitHookTargets(args: string[]): InitHookTarget[] {
+  const explicitTargets = new Set<InitHookTarget>();
+  const hooksValue = optionValue(args, "--hooks");
+
+  if (hooksValue) {
+    for (const rawItem of hooksValue.split(",")) {
+      const item = rawItem.trim().toLowerCase();
+      if (!item) {
+        continue;
+      }
+
+      if (item === "copilot" || item === "copilot-vs") {
+        explicitTargets.add("copilot-vs");
+        continue;
+      }
+
+      if (item === "copilot-cli") {
+        explicitTargets.add("copilot-cli");
+        continue;
+      }
+
+      if (item === "codex") {
+        explicitTargets.add("codex");
+        continue;
+      }
+
+      throw new Error(`Unknown hook target '${rawItem}'. Use codex, copilot-vs, or copilot-cli.`);
+    }
+  }
+
+  if (args.includes("--copilot") || args.includes("--copilot-vs")) {
+    explicitTargets.add("copilot-vs");
+  }
+  if (args.includes("--copilot-cli")) {
+    explicitTargets.add("copilot-cli");
+  }
+  if (args.includes("--codex")) {
+    explicitTargets.add("codex");
+  }
+
+  if (explicitTargets.size === 0) {
+    return ["copilot-vs", "copilot-cli", "codex"];
+  }
+
+  return [...explicitTargets];
+}
+
+function extractVSCodeGuardCommand(input: VSCodeHookInput | null): string | null {
+  const candidates: unknown[] = [
+    input?.tool_input,
+    input?.toolArgs,
+    input?.tool_name === "shell" || input?.toolName === "shell" ? input : null,
+    input?.tool_name === "powershell" || input?.toolName === "powershell" ? input : null,
+    input
   ];
 
   for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim()) {
-      return candidate.trim();
+    const extracted = extractNestedCommandString(candidate);
+    if (extracted) {
+      return extracted;
     }
   }
 
@@ -200,35 +333,34 @@ async function readStdInText(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8").trim();
 }
 
-function emitVSCodeHookResponse(additionalContext?: string): void {
-  const payload = additionalContext
-    ? {
-        continue: true,
-        hookSpecificOutput: {
-          hookEventName: "PostToolUse",
-          additionalContext
-        }
-      }
-    : { continue: true };
-
-  console.log(JSON.stringify(payload));
+function emitCopilotHookResponse(_additionalContext?: string): void {
+  // Copilot CLI does not require a wrapped success payload for non-decision hooks.
 }
 
-function emitVSCodeGuardDecision(
+function emitCopilotGuardDecision(
   decision: "allow" | "ask" | "deny",
   reason: string,
   additionalContext?: string
 ): void {
   console.log(
     JSON.stringify({
-      continue: true,
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: decision,
-        permissionDecisionReason: reason,
-        ...(additionalContext ? { additionalContext } : {})
-      }
+      permissionDecision: decision,
+      permissionDecisionReason: reason,
+      ...(additionalContext ? { additionalContext } : {})
     })
+  );
+}
+
+function emitCopilotPermissionRequestDecision(decision: "allow" | "deny", message?: string): void {
+  console.log(
+    JSON.stringify(
+      decision === "allow"
+        ? { behavior: "allow" }
+        : {
+            behavior: "deny",
+            ...(message ? { message } : {})
+          }
+    )
   );
 }
 
@@ -1285,7 +1417,8 @@ async function gitStatusSnapshot(
       (filePath) =>
         !filePath.startsWith(".anvil/") &&
         filePath !== ".anvilignore" &&
-        filePath !== ".github/hooks/anvil-copilot.json" &&
+        filePath !== ".github/hooks/anvil-copilot-vs.json" &&
+        filePath !== ".github/hooks/anvil-copilot-cli.json" &&
         filePath !== ".codex/hooks.json"
     )
   };
@@ -1307,6 +1440,37 @@ function formatStatusLine(label: string, value: string): string {
   return `${label}: ${value}`;
 }
 
+function normalizeHookFilePathForRepo(repositoryRoot: string, filePath: string): string {
+  const normalizedRepositoryRoot = path.resolve(repositoryRoot).replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalizedFilePath = path.resolve(filePath).replace(/\\/g, "/");
+
+  if (
+    normalizedFilePath.length > normalizedRepositoryRoot.length &&
+    normalizedFilePath.startsWith(`${normalizedRepositoryRoot}/`)
+  ) {
+    return normalizedFilePath.slice(normalizedRepositoryRoot.length + 1);
+  }
+
+  return filePath.replace(/\\/g, "/");
+}
+
+function normalizeHookFilePathsForRepo(repositoryRoot: string, filePaths: string[]): string[] {
+  return filePaths.map((filePath) => normalizeHookFilePathForRepo(repositoryRoot, filePath));
+}
+
+async function commandExists(commandName: string): Promise<boolean> {
+  try {
+    if (process.platform === "win32") {
+      await execFileAsync("where", [commandName], { windowsHide: true });
+    } else {
+      await execFileAsync("which", [commandName]);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function printHookStatus(
   repositoryRoot: string,
   launchCwd: string,
@@ -1317,21 +1481,32 @@ async function printHookStatus(
   const config = await loadHookConfig(repositoryRoot);
   const policy = await loadExecutionGuardPolicy(repositoryRoot);
   const hookConfigFile = hookConfigPath(repositoryRoot);
-  const copilotHookFile = vscodeCopilotHookConfigPath(repositoryRoot);
+  const copilotVsHookFile = vscodeCopilotHookConfigPath(repositoryRoot);
+  const copilotCliHookFile = copilotCliHookConfigPath(repositoryRoot);
   const codexHookFile = codexHookConfigPath(repositoryRoot);
   const policyFile = path.join(repositoryRoot, ".anvil", "policy.yaml");
   const orchestrationFile = path.join(repositoryRoot, ".anvil", "orchestration.yaml");
   const guardScriptFile = executionGuardScriptPath(repositoryRoot);
   const codexPromptWrapperFile = codexPromptWrapperPath(repositoryRoot);
-  const copilotPromptWrapperFile = copilotPromptWrapperPath(repositoryRoot);
+  const copilotVsPromptWrapperFile = path.join(repositoryRoot, ".anvil", "anvil-copilot-vs-prompt-submit.mjs");
+  const copilotCliPromptWrapperFile = copilotCliPromptWrapperPath(repositoryRoot);
   const hookWrapperErrorFile = hookWrapperErrorLogPath(repositoryRoot);
   const anvilIgnoreFile = path.join(repositoryRoot, ".anvilignore");
   const ignorePatternCount = ignoreRules?.patterns.length ?? 0;
   const gitStatus = await gitStatusSnapshot(repositoryRoot, ignoreRules);
+  const copilotCliRequiresPwsh = process.platform === "win32";
+  const pwshAvailable = copilotCliRequiresPwsh ? await commandExists("pwsh") : true;
 
-  const copilotReady = existsSync(copilotHookFile) && Boolean(config.copilot?.autoCheckpoint);
+  const copilotVsReady = existsSync(copilotVsHookFile) && Boolean(config.copilotVs?.autoCheckpoint);
+  const copilotCliReady =
+    existsSync(copilotCliHookFile) && Boolean(config.copilotCli?.autoCheckpoint) && pwshAvailable;
   const codexReady = existsSync(codexHookFile) && Boolean(config.codex?.autoCheckpoint);
-  const executionGuardReady = existsSync(copilotHookFile) && existsSync(codexHookFile) && existsSync(guardScriptFile) && policy.enabled;
+  const executionGuardReady =
+    existsSync(copilotVsHookFile) &&
+    existsSync(copilotCliHookFile) &&
+    existsSync(codexHookFile) &&
+    existsSync(guardScriptFile) &&
+    policy.enabled;
   const lastHookExecution = await readLastHookExecutionLog(repositoryRoot);
 
   console.log("Anvil hook status\n");
@@ -1343,22 +1518,28 @@ async function printHookStatus(
   console.log(`  ${formatStatusLine(".anvil/orchestration.yaml", existsSync(orchestrationFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine(".anvil/anvil-execution-guard.mjs", existsSync(guardScriptFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine(".anvil/anvil-codex-prompt-submit.mjs", existsSync(codexPromptWrapperFile) ? "present" : "missing")}`);
-  console.log(`  ${formatStatusLine(".anvil/anvil-copilot-prompt-submit.mjs", existsSync(copilotPromptWrapperFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".anvil/anvil-copilot-vs-prompt-submit.mjs", existsSync(copilotVsPromptWrapperFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".anvil/anvil-copilot-cli-prompt-submit.mjs", existsSync(copilotCliPromptWrapperFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine(".anvil/hook-wrapper-errors.log", existsSync(hookWrapperErrorFile) ? "present" : "missing")}`);
-  console.log(`  ${formatStatusLine("copilot.autoCheckpoint", String(config.copilot?.autoCheckpoint ?? false))}`);
+  console.log(`  ${formatStatusLine("copilotVs.autoCheckpoint", String(config.copilotVs?.autoCheckpoint ?? false))}`);
+  console.log(`  ${formatStatusLine("copilotCli.autoCheckpoint", String(config.copilotCli?.autoCheckpoint ?? false))}`);
+  if (copilotCliRequiresPwsh) {
+    console.log(`  ${formatStatusLine("copilotCli.pwshAvailable", pwshAvailable ? "true" : "false")}`);
+  }
   console.log(`  ${formatStatusLine("codex.autoCheckpoint", String(config.codex?.autoCheckpoint ?? false))}`);
   console.log(`  ${formatStatusLine("executionGuard.enabled", String(policy.enabled))}`);
   console.log(
     `  ${formatStatusLine(
       "executionGuard.enforcementMode",
       policy.askAsDeny
-        ? "codex: strict (ask -> deny), copilot: host-ask"
-        : "codex: host-ask, copilot: host-ask"
+        ? "codex: strict (ask -> deny), copilotVs: host-ask, copilotCli: host-ask"
+        : "codex: host-ask, copilotVs: host-ask, copilotCli: host-ask"
     )}`
   );
   console.log("");
   console.log("Installed hook files");
-  console.log(`  ${formatStatusLine(".github/hooks/anvil-copilot.json", existsSync(copilotHookFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".github/hooks/anvil-copilot-vs.json", existsSync(copilotVsHookFile) ? "present" : "missing")}`);
+  console.log(`  ${formatStatusLine(".github/hooks/anvil-copilot-cli.json", existsSync(copilotCliHookFile) ? "present" : "missing")}`);
   console.log(`  ${formatStatusLine(".codex/hooks.json", existsSync(codexHookFile) ? "present" : "missing")}`);
   console.log("");
   console.log("Ignore rules");
@@ -1373,7 +1554,8 @@ async function printHookStatus(
   }
   console.log("");
   console.log("Ready state");
-  console.log(`  ${formatStatusLine("Copilot hook ready", copilotReady ? "yes" : "no")}`);
+  console.log(`  ${formatStatusLine("Copilot VS hook ready", copilotVsReady ? "yes" : "no")}`);
+  console.log(`  ${formatStatusLine("Copilot CLI hook ready", copilotCliReady ? "yes" : "no")}`);
   console.log(`  ${formatStatusLine("Codex hook ready", codexReady ? "yes" : "no")}`);
   console.log(`  ${formatStatusLine("Execution guard ready", executionGuardReady ? "yes" : "no")}`);
   console.log("");
@@ -1401,6 +1583,9 @@ async function printHookStatus(
   console.log("");
   console.log("Notes");
   console.log("  Hooks only auto-checkpoint when the host actually executes them and autoCheckpoint is true.");
+  if (copilotCliRequiresPwsh && !pwshAvailable) {
+    console.log("  Copilot CLI on Windows requires PowerShell 7+ (`pwsh`) for the generated hook commands.");
+  }
   console.log("  If a hook looks installed but nothing fires, verify the editor/agent supports repo hooks in that session.");
 }
 
@@ -1423,8 +1608,18 @@ async function main(): Promise<void> {
     case "init": {
       await store.init();
       const config = await store.loadConfig();
-      const hookPath = await installVSCodeCopilotHook(repositoryRoot);
-      const codexHookPath = await installCodexHook(repositoryRoot);
+      const pwshAvailable = process.platform === "win32" ? await commandExists("pwsh") : true;
+      const selectedHookTargets = parseInitHookTargets(args);
+      const installedHookPaths: string[] = [];
+      if (selectedHookTargets.includes("copilot-vs")) {
+        installedHookPaths.push(`Copilot VS hook: ${await installCopilotVsHook(repositoryRoot)}`);
+      }
+      if (selectedHookTargets.includes("copilot-cli")) {
+        installedHookPaths.push(`Copilot CLI hook: ${await installCopilotCliHook(repositoryRoot)}`);
+      }
+      if (selectedHookTargets.includes("codex")) {
+        installedHookPaths.push(`Codex hook: ${await installCodexHook(repositoryRoot)}`);
+      }
       const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
       const policyTemplate = await ensurePolicyTemplate(repositoryRoot);
       const orchestrationTemplate = await ensureOrchestrationTemplate(repositoryRoot);
@@ -1434,8 +1629,9 @@ async function main(): Promise<void> {
       console.log(`Shadow store: ${config.shadowGitDir}`);
       console.log(`Metadata: ${config.metadataFile}`);
       console.log(`Anvil ignore: ${anvilIgnore.filePath}`);
-      console.log(`Copilot hook: ${hookPath}`);
-      console.log(`Codex hook: ${codexHookPath}`);
+      for (const line of installedHookPaths) {
+        console.log(line);
+      }
       console.log(`Hook config: ${hookConfigPath}`);
       console.log(`Execution policy: ${policyTemplate.filePath}`);
       console.log(`Orchestration config: ${orchestrationTemplate.filePath}`);
@@ -1447,8 +1643,20 @@ async function main(): Promise<void> {
       } else if (anvilIgnore.source === "starter") {
         console.log("Anvil ignore was created with a starter template because .gitignore was not found.");
       }
-      console.log("Copilot and Codex auto-checkpoint remain disabled until you set autoCheckpoint: true in .anvil/hooks.yaml.");
+      const selectedLabel =
+        selectedHookTargets.length === 3
+          ? "Copilot VS, Copilot CLI, and Codex"
+          : selectedHookTargets
+              .map((target) =>
+                target === "copilot-vs" ? "Copilot VS" : target === "copilot-cli" ? "Copilot CLI" : "Codex"
+              )
+              .join(", ");
+      const selectedVerb = selectedHookTargets.length === 1 ? "remains" : "remain";
+      console.log(`${selectedLabel} auto-checkpoint ${selectedVerb} disabled until you set autoCheckpoint: true in .anvil/hooks.yaml.`);
       console.log("Execution safety remains disabled until you set executionGuard.enabled: true in .anvil/policy.yaml.");
+      if (process.platform === "win32" && !pwshAvailable && selectedHookTargets.includes("copilot-cli")) {
+        console.log("Copilot CLI prerequisite warning: PowerShell 7+ (`pwsh`) is not installed or not on PATH, so Windows Copilot CLI hooks will not run yet.");
+      }
       return;
     }
 
@@ -1466,18 +1674,57 @@ async function main(): Promise<void> {
 
     case "install-copilot-hook": {
       await store.init();
-      const hookPath = await installVSCodeCopilotHook(repositoryRoot);
+      const hookPath = await installCopilotVsHook(repositoryRoot);
       const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
       const policyTemplate = await ensurePolicyTemplate(repositoryRoot);
       const orchestrationTemplate = await ensureOrchestrationTemplate(repositoryRoot);
-      console.log(`Installed VS Code Copilot hook at ${hookPath}`);
+      console.log(`Installed Copilot VS hook at ${hookPath}`);
+      console.log("Compatibility note: `install-copilot-hook` currently refreshes the Copilot VS setup. Use `install-copilot-cli-hook` for Copilot CLI.");
       console.log(`Hook config: ${hookConfigPath}`);
       console.log(`Execution policy: ${policyTemplate.filePath}`);
       console.log(`Orchestration config: ${orchestrationTemplate.filePath}`);
       if (orchestrationTemplate.migratedFromLegacy) {
         console.log("Orchestration config was created by migrating the legacy .anvil/extensions.yaml file.");
       }
-      console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Copilot file edits.");
+      console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Copilot VS file edits.");
+      return;
+    }
+
+    case "install-copilot-vs-hook": {
+      await store.init();
+      const hookPath = await installCopilotVsHook(repositoryRoot);
+      const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
+      const policyTemplate = await ensurePolicyTemplate(repositoryRoot);
+      const orchestrationTemplate = await ensureOrchestrationTemplate(repositoryRoot);
+      console.log(`Installed Copilot VS hook at ${hookPath}`);
+      console.log(`Hook config: ${hookConfigPath}`);
+      console.log(`Execution policy: ${policyTemplate.filePath}`);
+      console.log(`Orchestration config: ${orchestrationTemplate.filePath}`);
+      if (orchestrationTemplate.migratedFromLegacy) {
+        console.log("Orchestration config was created by migrating the legacy .anvil/extensions.yaml file.");
+      }
+      console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Copilot VS file edits.");
+      return;
+    }
+
+    case "install-copilot-cli-hook": {
+      await store.init();
+      const pwshAvailable = process.platform === "win32" ? await commandExists("pwsh") : true;
+      const hookPath = await installCopilotCliHook(repositoryRoot);
+      const hookConfigPath = await ensureHookConfigTemplate(repositoryRoot);
+      const policyTemplate = await ensurePolicyTemplate(repositoryRoot);
+      const orchestrationTemplate = await ensureOrchestrationTemplate(repositoryRoot);
+      console.log(`Installed Copilot CLI hook at ${hookPath}`);
+      console.log(`Hook config: ${hookConfigPath}`);
+      console.log(`Execution policy: ${policyTemplate.filePath}`);
+      console.log(`Orchestration config: ${orchestrationTemplate.filePath}`);
+      if (orchestrationTemplate.migratedFromLegacy) {
+        console.log("Orchestration config was created by migrating the legacy .anvil/extensions.yaml file.");
+      }
+      console.log("Enable .anvil/hooks.yaml to allow automatic Anvil checkpoints after Copilot CLI file edits.");
+      if (process.platform === "win32" && !pwshAvailable) {
+        console.log("Prerequisite warning: PowerShell 7+ (`pwsh`) is not installed or not on PATH, so Copilot CLI hooks will not run on Windows until it is available.");
+      }
       return;
     }
 
@@ -1518,25 +1765,33 @@ async function main(): Promise<void> {
       }
 
       await store.init();
-      const vscodeHookMode = args.includes("--vscode-hook");
+      const copilotVsHookMode = args.includes("--copilot-vs-hook") || args.includes("--vscode-hook");
+      const copilotCliHookMode = args.includes("--copilot-cli-hook") || args.includes("--copilot-hook");
+      const copilotHookMode = copilotVsHookMode || copilotCliHookMode;
       const codexHookMode = args.includes("--codex-hook");
-      const hookMode = vscodeHookMode ? "vscode-hook" : codexHookMode ? "codex-hook" : "cli";
-      const stdInText = vscodeHookMode || codexHookMode ? await readStdInText() : "";
+      const forcedPermissionRequest = args.includes("--permission-request");
+      const hookMode = copilotVsHookMode ? "copilot-vs-hook" : copilotCliHookMode ? "copilot-cli-hook" : codexHookMode ? "codex-hook" : "cli";
+      const stdInText = copilotHookMode || codexHookMode ? await readStdInText() : "";
       let vscodeHookInput: VSCodeHookInput | null = null;
       let codexHookInput: CodexHookInput | null = null;
 
-      if (vscodeHookMode && stdInText) {
+      if (copilotHookMode && stdInText) {
         try {
           vscodeHookInput = JSON.parse(stdInText) as VSCodeHookInput;
         } catch {
           await appendHookExecutionLog(repositoryRoot, {
             timestamp: new Date().toISOString(),
-            hookName: "copilot-pre-tool-use",
+            hookName: copilotCliHookMode ? "copilot-cli-pre-tool-use" : "copilot-vs-pre-tool-use",
             status: "invalid_payload",
             mode: hookMode,
-            message: "Could not parse VS Code PreToolUse payload."
+            message: "Could not parse Copilot CLI hook payload."
           });
-          emitVSCodeGuardDecision("deny", "Anvil execution guard could not parse the tool payload.");
+          const isPermissionRequestPayload = stdInText.includes("\"hook_event_name\":\"PermissionRequest\"") || stdInText.includes("\"hookEventName\":\"PermissionRequest\"");
+          if (isPermissionRequestPayload) {
+            emitCopilotPermissionRequestDecision("deny", "Anvil execution guard could not parse the tool payload.");
+          } else {
+            emitCopilotGuardDecision("deny", "Anvil execution guard could not parse the tool payload.");
+          }
           return;
         }
       }
@@ -1562,14 +1817,17 @@ async function main(): Promise<void> {
         }
       }
 
+      const copilotEventName = vscodeHookInput?.hookEventName ?? vscodeHookInput?.hook_event_name;
+      const isCopilotPermissionRequest =
+        copilotHookMode && (forcedPermissionRequest || copilotEventName === "PermissionRequest" || copilotEventName === "permissionRequest");
       const isCodexPermissionRequest = codexHookMode && codexHookInput?.hook_event_name === "PermissionRequest";
       const toolName = vscodeHookInput?.tool_name ?? codexHookInput?.tool_name ?? "unknown";
-      const commandText = vscodeHookMode
+      const commandText = copilotHookMode
         ? extractVSCodeGuardCommand(vscodeHookInput)
         : codexHookMode
           ? extractCodexGuardCommand(codexHookInput)
           : optionValue(args, "--command");
-      const filePaths = vscodeHookMode
+      const filePaths = copilotHookMode
         ? extractHookFilePaths(vscodeHookInput)
         : codexHookMode
           ? extractCodexHookFilePaths(codexHookInput)
@@ -1580,8 +1838,10 @@ async function main(): Promise<void> {
         commandText,
         filePaths
       });
-      const hookName = vscodeHookMode
-        ? "copilot-pre-tool-use"
+      const hookName = isCopilotPermissionRequest
+        ? (copilotCliHookMode ? "copilot-cli-permission-request" : "copilot-vs-permission-request")
+        : copilotHookMode
+          ? (copilotCliHookMode ? "copilot-cli-pre-tool-use" : "copilot-vs-pre-tool-use")
         : isCodexPermissionRequest
           ? "codex-permission-request"
           : "codex-pre-tool-use";
@@ -1601,19 +1861,32 @@ async function main(): Promise<void> {
       });
       await appendPendingHookOrchestrationEvent(repositoryRoot, {
         hookName,
-        host: vscodeHookMode ? "copilot" : "codex",
-        event: isCodexPermissionRequest ? "PermissionRequest" : "PreToolUse",
+        host: copilotCliHookMode ? "copilotCli" : copilotVsHookMode ? "copilotVs" : "codex",
+        event: isCopilotPermissionRequest || isCodexPermissionRequest ? "PermissionRequest" : "PreToolUse",
         files: filePaths,
         timestamp: new Date().toISOString()
       });
       launchHookOrchestrationProcessor(repositoryRoot);
 
-      const explanation = `${evaluation.category}: ${evaluation.reason}`;
-      const additionalContext = `${evaluation.reason} ${evaluation.nextStep}`.trim();
-      if (vscodeHookMode) {
-        emitVSCodeGuardDecision(evaluation.decision, explanation, additionalContext);
-        return;
-      }
+        const explanation = `${evaluation.category}: ${evaluation.reason}`;
+        const additionalContext = `${evaluation.reason} ${evaluation.nextStep}`.trim();
+        if (copilotHookMode) {
+          const copilotExternalDecision =
+            evaluation.decision === "ask" && policy.askAsDeny
+              ? "deny"
+              : evaluation.decision;
+          if (isCopilotPermissionRequest) {
+            if (copilotExternalDecision === "deny") {
+              emitCopilotPermissionRequestDecision("deny", evaluation.reason);
+            } else if (copilotExternalDecision === "allow") {
+              emitCopilotPermissionRequestDecision("allow");
+            }
+            return;
+          }
+
+          emitCopilotGuardDecision(copilotExternalDecision, explanation, additionalContext);
+          return;
+        }
 
       if (codexHookMode) {
         const codexExternalDecision =
@@ -1728,18 +2001,24 @@ async function main(): Promise<void> {
         hookName !== "copilot-after-edit" &&
         hookName !== "codex-after-edit" &&
         hookName !== "codex-prompt-submit" &&
-        hookName !== "copilot-prompt-submit"
+        hookName !== "copilot-prompt-submit" &&
+        hookName !== "copilot-vs-prompt-submit" &&
+        hookName !== "copilot-cli-prompt-submit"
       ) {
-        throw new Error("Unknown hook. Supported hooks: status, doctor, copilot-after-edit, codex-after-edit, codex-prompt-submit, copilot-prompt-submit");
+        throw new Error(
+          "Unknown hook. Supported hooks: status, doctor, copilot-after-edit, codex-after-edit, codex-prompt-submit, copilot-prompt-submit, copilot-vs-prompt-submit, copilot-cli-prompt-submit"
+        );
       }
 
-      const vscodeHookMode = args.includes("--vscode-hook");
+      const copilotVsHookMode = args.includes("--copilot-vs-hook") || args.includes("--vscode-hook");
+      const copilotCliHookMode = args.includes("--copilot-cli-hook") || args.includes("--copilot-hook");
+      const copilotHookMode = copilotVsHookMode || copilotCliHookMode;
       const codexHookMode = args.includes("--codex-hook");
-      const hookMode = vscodeHookMode ? "vscode-hook" : codexHookMode ? "codex-hook" : "cli";
-      const stdInText = vscodeHookMode || codexHookMode ? await readStdInText() : "";
+      const hookMode = copilotVsHookMode ? "copilot-vs-hook" : copilotCliHookMode ? "copilot-cli-hook" : codexHookMode ? "codex-hook" : "cli";
+      const stdInText = copilotHookMode || codexHookMode ? await readStdInText() : "";
       let vscodeHookInput: VSCodeHookInput | null = null;
       let codexHookInput: CodexHookInput | null = null;
-      if (vscodeHookMode && stdInText) {
+      if (copilotHookMode && stdInText) {
         try {
           vscodeHookInput = JSON.parse(stdInText) as VSCodeHookInput;
         } catch {
@@ -1748,9 +2027,9 @@ async function main(): Promise<void> {
             hookName,
             status: "invalid_payload",
             mode: hookMode,
-            message: "Could not parse VS Code hook payload."
+            message: "Could not parse Copilot CLI hook payload."
           });
-          emitVSCodeHookResponse();
+          emitCopilotHookResponse();
           return;
         }
       }
@@ -1847,8 +2126,12 @@ async function main(): Promise<void> {
         return;
       }
 
-      if (hookName === "copilot-prompt-submit") {
-        if (vscodeHookMode && !isCopilotPromptSubmitEvent(vscodeHookInput)) {
+      if (
+        hookName === "copilot-prompt-submit" ||
+        hookName === "copilot-vs-prompt-submit" ||
+        hookName === "copilot-cli-prompt-submit"
+      ) {
+        if (copilotHookMode && !isCopilotPromptSubmitEvent(vscodeHookInput)) {
           await appendHookExecutionLog(repositoryRoot, {
             timestamp: new Date().toISOString(),
             hookName,
@@ -1856,15 +2139,17 @@ async function main(): Promise<void> {
             mode: hookMode,
             message: "Hook payload was not a Copilot prompt-submit event."
           });
-          emitVSCodeHookResponse();
+          emitCopilotHookResponse();
           return;
         }
 
         const config = await loadHookConfig(repositoryRoot);
-        if (!config.copilot?.autoCheckpoint) {
+        const copilotHookConfig = copilotCliHookMode ? config.copilotCli : config.copilotVs;
+        if (!copilotHookConfig?.autoCheckpoint) {
+          
           await appendPendingHookOrchestrationEvent(repositoryRoot, {
             hookName,
-            host: "copilot",
+            host: copilotCliHookMode ? "copilotCli" : "copilotVs",
             event: "UserPromptSubmit",
             files: [],
             timestamp: new Date().toISOString()
@@ -1878,7 +2163,7 @@ async function main(): Promise<void> {
             branch: await resolvedBranchLabel(store),
             message: "autoCheckpoint is disabled in .anvil/hooks.yaml."
           });
-          emitVSCodeHookResponse();
+          emitCopilotHookResponse();
           return;
         }
 
@@ -1887,7 +2172,7 @@ async function main(): Promise<void> {
         if (!prompt) {
           await appendPendingHookOrchestrationEvent(repositoryRoot, {
             hookName,
-            host: "copilot",
+            host: copilotCliHookMode ? "copilotCli" : "copilotVs",
             event: "UserPromptSubmit",
             files: [],
             timestamp: new Date().toISOString()
@@ -1901,40 +2186,47 @@ async function main(): Promise<void> {
             branch: await resolvedBranchLabel(store),
             message: "No prompt text was available to capture."
           });
-          emitVSCodeHookResponse();
+          emitCopilotHookResponse();
           return;
         }
 
-        await writePendingCopilotPrompt(repositoryRoot, prompt, rationale);
+        if (copilotCliHookMode) {
+          await writePendingCopilotCliPrompt(repositoryRoot, prompt, rationale);
+        } else {
+          await writePendingCopilotPrompt(repositoryRoot, prompt, rationale);
+        }
         await appendHookExecutionLog(repositoryRoot, {
           timestamp: new Date().toISOString(),
           hookName,
           status: "captured",
           mode: hookMode,
           branch: await resolvedBranchLabel(store),
-          message: "Captured Copilot prompt for the next Anvil checkpoint."
+          message: `Captured ${copilotCliHookMode ? "Copilot CLI" : "Copilot VS"} prompt for the next Anvil checkpoint.`
         });
         await appendPendingHookOrchestrationEvent(repositoryRoot, {
           hookName,
-          host: "copilot",
+          host: copilotCliHookMode ? "copilotCli" : "copilotVs",
           event: "UserPromptSubmit",
           files: [],
           timestamp: new Date().toISOString()
         });
         launchHookOrchestrationProcessor(repositoryRoot);
-        emitVSCodeHookResponse("Captured Copilot prompt for the next Anvil checkpoint.");
+        emitCopilotHookResponse(`Captured ${copilotCliHookMode ? "Copilot CLI" : "Copilot VS"} prompt for the next Anvil checkpoint.`);
         return;
       }
 
-      if (vscodeHookMode && !isCopilotFileEditEvent(vscodeHookInput)) {
+      if (copilotHookMode && !isCopilotFileEditEvent(vscodeHookInput)) {
+        const copilotEventName = vscodeHookInput?.hookEventName ?? vscodeHookInput?.hook_event_name ?? "unknown";
+        const copilotToolName = vscodeHookInput?.toolName ?? vscodeHookInput?.tool_name ?? "unknown";
+        const extractedPaths = normalizeHookFilePathsForRepo(repositoryRoot, extractHookFilePaths(vscodeHookInput));
         await appendHookExecutionLog(repositoryRoot, {
           timestamp: new Date().toISOString(),
           hookName,
           status: "ignored",
           mode: hookMode,
-          message: "Hook payload was not a Copilot file-edit event."
+          message: `Hook payload was not a Copilot file-edit event. event=${copilotEventName}; tool=${copilotToolName}; files=${extractedPaths.join(", ") || "none"}`
         });
-        emitVSCodeHookResponse();
+        emitCopilotHookResponse();
         return;
       }
       if (codexHookMode && !isCodexFileEditEvent(codexHookInput)) {
@@ -1948,7 +2240,7 @@ async function main(): Promise<void> {
         return;
       }
 
-      const hookFiles = vscodeHookMode
+      const hookFiles = copilotHookMode
         ? extractHookFilePaths(vscodeHookInput)
         : codexHookMode
           ? (() => {
@@ -1956,15 +2248,19 @@ async function main(): Promise<void> {
               return extracted.length > 0 ? extracted : extractCodexHookFilePathsFromText(stdInText);
             })()
           : [];
+      const normalizedHookFiles = normalizeHookFilePathsForRepo(repositoryRoot, hookFiles);
 
       const config = await loadHookConfig(repositoryRoot);
-      const hookConfig = hookName === "copilot-after-edit" ? config.copilot : config.codex;
+      const hookConfig =
+        hookName === "copilot-after-edit"
+          ? (copilotCliHookMode ? config.copilotCli : config.copilotVs)
+          : config.codex;
       if (!hookConfig?.autoCheckpoint) {
         await appendPendingHookOrchestrationEvent(repositoryRoot, {
           hookName,
-          host: hookName === "copilot-after-edit" ? "copilot" : "codex",
+          host: hookName === "copilot-after-edit" ? (copilotCliHookMode ? "copilotCli" : "copilotVs") : "codex",
           event: "PostToolUse",
-          files: hookFiles,
+          files: normalizedHookFiles,
           timestamp: new Date().toISOString()
         });
         launchHookOrchestrationProcessor(repositoryRoot);
@@ -1976,8 +2272,8 @@ async function main(): Promise<void> {
           branch: await resolvedBranchLabel(store),
           message: "autoCheckpoint is disabled in .anvil/hooks.yaml."
         });
-        if (vscodeHookMode) {
-          emitVSCodeHookResponse();
+        if (copilotHookMode) {
+          emitCopilotHookResponse();
           return;
         }
         if (codexHookMode) {
@@ -1987,15 +2283,23 @@ async function main(): Promise<void> {
         return;
       }
 
-      const defaultSummary = hookName === "copilot-after-edit" ? "Copilot file changes" : "Codex file changes";
+      const defaultSummary =
+        hookName === "copilot-after-edit"
+          ? (copilotCliHookMode ? "Copilot CLI file changes" : "Copilot VS file changes")
+          : "Codex file changes";
       const summary = optionValue(args, "--summary") ?? hookConfig.summary ?? defaultSummary;
       const kind = (optionValue(args, "--kind") ?? hookConfig.kind ?? "after_edit_batch") as CheckpointKind;
-      const defaultCommand = hookName === "copilot-after-edit" ? "copilot" : "codex";
+      const defaultCommand =
+        hookName === "copilot-after-edit"
+          ? (copilotCliHookMode ? "copilot-cli" : "copilot-vs")
+          : "codex";
       const commandValue = optionValue(args, "--command") ?? hookConfig.command ?? defaultCommand;
       const pendingCodexPrompt = codexHookMode ? await readPendingCodexPrompt(repositoryRoot) : null;
-      const pendingCopilotPrompt = vscodeHookMode ? await readPendingCopilotPrompt(repositoryRoot) : null;
+      const pendingCopilotPrompt = copilotHookMode
+        ? (copilotCliHookMode ? await readPendingCopilotCliPrompt(repositoryRoot) : await readPendingCopilotPrompt(repositoryRoot))
+        : null;
       const rationale = optionValue(args, "--rationale")
-        ?? (vscodeHookMode ? extractVSCodeHookRationale(vscodeHookInput) : codexHookMode ? extractCodexHookRationale(codexHookInput) : null)
+        ?? (copilotHookMode ? extractVSCodeHookRationale(vscodeHookInput) : codexHookMode ? extractCodexHookRationale(codexHookInput) : null)
         ?? pendingCopilotPrompt?.rationale
         ?? pendingCodexPrompt?.rationale
         ?? undefined;
@@ -2004,18 +2308,20 @@ async function main(): Promise<void> {
         | "passed"
         | "failed";
       const prompt = optionValue(args, "--prompt")
-        ?? (vscodeHookMode ? extractVSCodeHookPrompt(vscodeHookInput) : codexHookMode ? extractCodexHookPrompt(codexHookInput) : null)
+        ?? (copilotHookMode ? extractVSCodeHookPrompt(vscodeHookInput) : codexHookMode ? extractCodexHookPrompt(codexHookInput) : null)
         ?? pendingCopilotPrompt?.prompt
         ?? pendingCodexPrompt?.prompt
         ?? undefined;
       const statusFiles = await gitStatusFiles(repositoryRoot, ignoreRules);
-      const files = vscodeHookMode
-        ? [...new Set(filterIgnoredAnvilPaths([...hookFiles, ...statusFiles], ignoreRules))]
+      const files = copilotHookMode
+        ? normalizedHookFiles.length > 0
+          ? [...new Set(filterIgnoredAnvilPaths(normalizedHookFiles, ignoreRules))]
+          : statusFiles
         : codexHookMode
-          ? hookFiles.length > 0
-            ? [...new Set(filterIgnoredAnvilPaths(hookFiles, ignoreRules))]
+          ? normalizedHookFiles.length > 0
+            ? [...new Set(filterIgnoredAnvilPaths(normalizedHookFiles, ignoreRules))]
             : statusFiles
-          : [...new Set(filterIgnoredAnvilPaths([...hookFiles, ...statusFiles], ignoreRules))];
+          : [...new Set(filterIgnoredAnvilPaths([...normalizedHookFiles, ...statusFiles], ignoreRules))];
 
       if (files.length === 0) {
         await appendHookExecutionLog(repositoryRoot, {
@@ -2026,8 +2332,8 @@ async function main(): Promise<void> {
           branch: await resolvedBranchLabel(store),
           message: "No Git-detected workspace changes were available to checkpoint."
         });
-        if (vscodeHookMode) {
-          emitVSCodeHookResponse();
+        if (copilotHookMode) {
+          emitCopilotHookResponse();
           return;
         }
         if (codexHookMode) {
@@ -2042,10 +2348,10 @@ async function main(): Promise<void> {
       const checkpoint = await store.recordCheckpoint({
         kind,
         summary,
-        snapshotMode: hookFiles.length > 0 ? "partial" : "full",
+        snapshotMode: normalizedHookFiles.length > 0 ? "partial" : "full",
         filesChanged: files,
         origin: "ai",
-        aiSource: hookName === "copilot-after-edit" ? "copilot" : "codex",
+        aiSource: hookName === "copilot-after-edit" ? (copilotCliHookMode ? "copilot-cli" : "copilot-vs") : "codex",
         prompt,
         rationale,
         commandsRun: commandValue ? [commandValue] : [],
@@ -2055,8 +2361,12 @@ async function main(): Promise<void> {
       await persistPreparedBeforeCheckpointActions(repositoryRoot, checkpoint.checkpointId, preparedBeforeCheckpoint);
       await runAfterCheckpointBlockingActions(repositoryRoot, store, checkpoint.checkpointId);
 
-      if (vscodeHookMode && (prompt || pendingCopilotPrompt?.prompt)) {
-        await clearPendingCopilotPrompt(repositoryRoot);
+      if (copilotHookMode && (prompt || pendingCopilotPrompt?.prompt)) {
+        if (copilotCliHookMode) {
+          await clearPendingCopilotCliPrompt(repositoryRoot);
+        } else {
+          await clearPendingCopilotPrompt(repositoryRoot);
+        }
       }
       if (codexHookMode && (prompt || pendingCodexPrompt?.prompt)) {
         await clearPendingCodexPrompt(repositoryRoot);
@@ -2074,7 +2384,7 @@ async function main(): Promise<void> {
       });
       await appendPendingHookOrchestrationEvent(repositoryRoot, {
         hookName,
-        host: hookName === "copilot-after-edit" ? "copilot" : "codex",
+        host: hookName === "copilot-after-edit" ? (copilotCliHookMode ? "copilotCli" : "copilotVs") : "codex",
         event: "PostToolUse",
         files: checkpoint.filesChanged,
         checkpointId: checkpoint.checkpointId,
@@ -2082,9 +2392,9 @@ async function main(): Promise<void> {
       });
       launchHookOrchestrationProcessor(repositoryRoot);
 
-      if (vscodeHookMode) {
+      if (copilotHookMode) {
         launchExtensionProcessor(repositoryRoot);
-        emitVSCodeHookResponse(`Anvil recorded checkpoint ${checkpoint.checkpointId} on branch ${checkpoint.gitBranch ?? "unknown"}.`);
+        emitCopilotHookResponse(`Anvil recorded checkpoint ${checkpoint.checkpointId} on branch ${checkpoint.gitBranch ?? "unknown"}.`);
         return;
       }
       if (codexHookMode) {

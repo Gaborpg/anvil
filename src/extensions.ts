@@ -84,7 +84,7 @@ export interface ExtensionRunnerOutput {
 
 export interface HookOrchestrationEvent {
   hookName: string;
-  host: "copilot" | "codex";
+  host: "copilotVs" | "copilotCli" | "codex";
   event: "PreToolUse" | "PermissionRequest" | "PostToolUse" | "UserPromptSubmit";
   files: string[];
   checkpointId?: string | null;
@@ -239,7 +239,9 @@ ${verificationBlocks}
 # lifecycle controls when Anvil runs trusted automation.
 lifecycle:
   aiHooks:
-    copilot:
+    copilotVs:
+      rules: {}
+    copilotCli:
       rules: {}
     codex:
       rules: {}
@@ -673,7 +675,7 @@ function parseLifecycleContent(content: string): OrchestrationConfig {
     if (lifecycleSection === "aiHooks") {
       if (line.startsWith("    ") && !line.startsWith("      ")) {
         const match = trimmed.match(/^([A-Za-z0-9_-]+):\s*$/);
-        currentAgent = match ? match[1] : null;
+        currentAgent = match ? (match[1] === "copilot" ? "copilotVs" : match[1]) : null;
         currentHookRule = null;
         currentAction = null;
         activeRuleArray = null;

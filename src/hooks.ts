@@ -14,16 +14,21 @@ export interface CopilotHookConfig {
 }
 
 export interface HookConfig {
-  copilot?: CopilotHookConfig;
+  copilotVs?: CopilotHookConfig;
+  copilotCli?: CopilotHookConfig;
   codex?: CopilotHookConfig;
 }
 
 export interface VSCodeHookInput {
   hookEventName?: string;
+  hook_event_name?: string;
   tool_name?: string;
+  toolName?: string;
+  tool_name_raw?: string;
   prompt?: unknown;
   userPrompt?: unknown;
   user_prompt?: unknown;
+  toolArgs?: unknown;
   tool_input?: {
     files?: unknown;
     filePath?: unknown;
@@ -67,10 +72,19 @@ export interface HookExecutionLogEntry {
   timestamp: string;
   hookName:
     | "copilot-after-edit"
+    | "copilot-vs-after-edit"
+    | "copilot-cli-after-edit"
     | "codex-after-edit"
     | "codex-prompt-submit"
     | "copilot-prompt-submit"
+    | "copilot-vs-prompt-submit"
+    | "copilot-cli-prompt-submit"
     | "copilot-pre-tool-use"
+    | "copilot-vs-pre-tool-use"
+    | "copilot-cli-pre-tool-use"
+    | "copilot-permission-request"
+    | "copilot-vs-permission-request"
+    | "copilot-cli-permission-request"
     | "codex-pre-tool-use"
     | "codex-permission-request"
     | "codex-hook-parse";
@@ -84,7 +98,7 @@ export interface HookExecutionLogEntry {
     | "allowed"
     | "asked"
     | "denied";
-  mode: "cli" | "vscode-hook" | "codex-hook";
+  mode: "cli" | "copilot-vs-hook" | "copilot-cli-hook" | "codex-hook";
   branch?: string;
   checkpointId?: string;
   files?: string[];
@@ -94,19 +108,26 @@ export interface HookExecutionLogEntry {
 const HOOKS_FILE_NAME = "hooks.yaml";
 const HOOK_EXECUTION_LOG_FILE_NAME = "hook-executions.jsonl";
 const HOOK_WRAPPER_ERROR_LOG_FILE_NAME = "hook-wrapper-errors.log";
-const COPILOT_PENDING_PROMPT_FILE_NAME = "copilot-pending-prompt.json";
+const COPILOT_VS_PENDING_PROMPT_FILE_NAME = "copilot-vs-pending-prompt.json";
+const COPILOT_CLI_PENDING_PROMPT_FILE_NAME = "copilot-cli-pending-prompt.json";
 const CODEX_PENDING_PROMPT_FILE_NAME = "codex-pending-prompt.json";
 const VSCODE_HOOKS_DIR = path.join(".github", "hooks");
-const VSCODE_COPILOT_HOOK_FILE_NAME = "anvil-copilot.json";
+const VSCODE_COPILOT_VS_HOOK_FILE_NAME = "anvil-copilot-vs.json";
+const VSCODE_COPILOT_CLI_HOOK_FILE_NAME = "anvil-copilot-cli.json";
 const CODEX_HOOKS_DIR = path.join(".codex");
 const CODEX_HOOKS_FILE_NAME = "hooks.json";
 const CODEX_WRAPPER_FILE_NAME = "anvil-codex-after-edit.mjs";
 const CODEX_PROMPT_WRAPPER_FILE_NAME = "anvil-codex-prompt-submit.mjs";
-const COPILOT_PROMPT_WRAPPER_FILE_NAME = "anvil-copilot-prompt-submit.mjs";
-const ANVIL_INTERNAL_HOOK_PATH = `${VSCODE_HOOKS_DIR.replace(/\\/g, "/")}/${VSCODE_COPILOT_HOOK_FILE_NAME}`;
+const COPILOT_VS_PROMPT_WRAPPER_FILE_NAME = "anvil-copilot-vs-prompt-submit.mjs";
+const COPILOT_CLI_PROMPT_WRAPPER_FILE_NAME = "anvil-copilot-cli-prompt-submit.mjs";
+const COPILOT_CLI_AFTER_EDIT_WRAPPER_FILE_NAME = "anvil-copilot-cli-after-edit.mjs";
+const ANVIL_INTERNAL_COPILOT_VS_HOOK_PATH = `${VSCODE_HOOKS_DIR.replace(/\\/g, "/")}/${VSCODE_COPILOT_VS_HOOK_FILE_NAME}`;
+const ANVIL_INTERNAL_COPILOT_CLI_HOOK_PATH = `${VSCODE_HOOKS_DIR.replace(/\\/g, "/")}/${VSCODE_COPILOT_CLI_HOOK_FILE_NAME}`;
 const ANVIL_INTERNAL_CODEX_HOOK_PATH = `${CODEX_HOOKS_DIR.replace(/\\/g, "/")}/${CODEX_HOOKS_FILE_NAME}`;
 const ANVIL_INTERNAL_CODEX_WRAPPER_PATH = `${CODEX_HOOKS_DIR.replace(/\\/g, "/")}/${CODEX_WRAPPER_FILE_NAME}`;
 const FILE_EDIT_TOOL_NAMES = new Set([
+  "create",
+  "edit",
   "editFiles",
   "createFile",
   "moveFile",
@@ -116,6 +137,19 @@ const FILE_EDIT_TOOL_NAMES = new Set([
   "move_file",
   "delete_file",
   "replace_string_in_file"
+]);
+
+const READ_ONLY_TOOL_NAMES = new Set([
+  "glob",
+  "grep",
+  "search",
+  "read",
+  "readFile",
+  "view",
+  "list",
+  "ls",
+  "getcwd",
+  "pwd"
 ]);
 
 function currentCliEntrypoint(): string {
@@ -133,12 +167,24 @@ function shellCommandForCurrentCli(args: string[]): string {
   return `"${nodeExecutable}" "${cliEntrypoint}" ${escapedArgs.map((value) => `"${value}"`).join(" ")}`;
 }
 
+function powershellQuote(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function powershellCommand(executable: string, args: string[]): string {
+  return `& ${[executable, ...args].map(powershellQuote).join(" ")}`;
+}
+
 function promptWrapperContent(
   repositoryRoot: string,
   cliEntrypoint: string,
   nodeExecutable: string,
-  hookName: "codex-prompt-submit" | "copilot-prompt-submit",
-  modeFlag: "--codex-hook" | "--vscode-hook"
+  hookName:
+    | "codex-prompt-submit"
+    | "copilot-prompt-submit"
+    | "copilot-vs-prompt-submit"
+    | "copilot-cli-prompt-submit",
+  modeFlag: "--codex-hook" | "--copilot-cli-hook" | "--copilot-vs-hook" | "--copilot-hook" | "--vscode-hook"
 ): string {
   const errorLogPath = path.join(repositoryRoot, ".anvil", HOOK_WRAPPER_ERROR_LOG_FILE_NAME);
   return `import { appendFile, mkdir } from "node:fs/promises";
@@ -213,7 +259,15 @@ export function hookWrapperErrorLogPath(repositoryRoot: string): string {
 }
 
 export function copilotPendingPromptPath(repositoryRoot: string): string {
-  return path.join(repositoryRoot, ".anvil", COPILOT_PENDING_PROMPT_FILE_NAME);
+  return path.join(repositoryRoot, ".anvil", COPILOT_VS_PENDING_PROMPT_FILE_NAME);
+}
+
+export function copilotVsPendingPromptPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", COPILOT_VS_PENDING_PROMPT_FILE_NAME);
+}
+
+export function copilotCliPendingPromptPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", COPILOT_CLI_PENDING_PROMPT_FILE_NAME);
 }
 
 export function codexPendingPromptPath(repositoryRoot: string): string {
@@ -225,7 +279,19 @@ export function codexPromptWrapperPath(repositoryRoot: string): string {
 }
 
 export function copilotPromptWrapperPath(repositoryRoot: string): string {
-  return path.join(repositoryRoot, ".anvil", COPILOT_PROMPT_WRAPPER_FILE_NAME);
+  return path.join(repositoryRoot, ".anvil", COPILOT_CLI_PROMPT_WRAPPER_FILE_NAME);
+}
+
+export function copilotVsPromptWrapperPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", COPILOT_VS_PROMPT_WRAPPER_FILE_NAME);
+}
+
+export function copilotCliPromptWrapperPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", COPILOT_CLI_PROMPT_WRAPPER_FILE_NAME);
+}
+
+export function copilotCliAfterEditWrapperPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, ".anvil", COPILOT_CLI_AFTER_EDIT_WRAPPER_FILE_NAME);
 }
 
 export interface PendingCodexPrompt {
@@ -258,7 +324,7 @@ function parseScalar(value: string): string | boolean {
 
 function parseHooksYaml(content: string): HookConfig {
   const result: HookConfig = {};
-  let section: "copilot" | "codex" | null = null;
+  let section: "copilotVs" | "copilotCli" | "codex" | null = null;
 
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.replace(/\t/g, "  ");
@@ -274,8 +340,13 @@ function parseHooksYaml(content: string): HookConfig {
       }
 
       const key = sectionMatch[1];
-      section = key === "copilot" || key === "codex" ? key : null;
-      if (section === "copilot" || section === "codex") {
+      section =
+        key === "copilotVs" || key === "copilotCli" || key === "codex"
+          ? key
+          : key === "copilot"
+            ? "copilotVs"
+            : null;
+      if (section === "copilotVs" || section === "copilotCli" || section === "codex") {
         result[section] ??= { autoCheckpoint: false };
       }
       continue;
@@ -293,7 +364,7 @@ function parseHooksYaml(content: string): HookConfig {
     const [, key, rawValue = ""] = pairMatch;
     const value = parseScalar(rawValue);
 
-    if (section === "copilot" || section === "codex") {
+    if (section === "copilotVs" || section === "copilotCli" || section === "codex") {
       const config = (result[section] ??= { autoCheckpoint: false });
       switch (key) {
         case "autoCheckpoint":
@@ -337,12 +408,18 @@ export async function ensureHookConfigTemplate(repositoryRoot: string): Promise<
   }
 
   await mkdir(path.dirname(filePath), { recursive: true });
-  const content = `# Optional Anvil repo-local hook config
-copilot:
+const content = `# Optional Anvil repo-local hook config
+copilotVs:
   autoCheckpoint: false
-  summary: "Copilot file changes"
+  summary: "Copilot VS file changes"
   kind: after_edit_batch
-  command: copilot
+  command: copilot-vs
+  testStatus: unknown
+copilotCli:
+  autoCheckpoint: false
+  summary: "Copilot CLI file changes"
+  kind: after_edit_batch
+  command: copilot-cli
   testStatus: unknown
 codex:
   autoCheckpoint: false
@@ -409,7 +486,22 @@ export async function writePendingCopilotPrompt(
   prompt: string,
   rationale?: string | null
 ): Promise<void> {
-  const filePath = copilotPendingPromptPath(repositoryRoot);
+  const filePath = copilotVsPendingPromptPath(repositoryRoot);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const payload: PendingCodexPrompt = {
+    prompt,
+    rationale: rationale ?? null,
+    capturedAt: new Date().toISOString()
+  };
+  await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+export async function writePendingCopilotCliPrompt(
+  repositoryRoot: string,
+  prompt: string,
+  rationale?: string | null
+): Promise<void> {
+  const filePath = copilotCliPendingPromptPath(repositoryRoot);
   await mkdir(path.dirname(filePath), { recursive: true });
   const payload: PendingCodexPrompt = {
     prompt,
@@ -443,7 +535,30 @@ export async function readPendingCodexPrompt(repositoryRoot: string): Promise<Pe
 }
 
 export async function readPendingCopilotPrompt(repositoryRoot: string): Promise<PendingCodexPrompt | null> {
-  const filePath = copilotPendingPromptPath(repositoryRoot);
+  const filePath = copilotVsPendingPromptPath(repositoryRoot);
+  if (!existsSync(filePath)) {
+    return null;
+  }
+
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<PendingCodexPrompt>;
+    if (!parsed.prompt || typeof parsed.prompt !== "string") {
+      return null;
+    }
+
+    return {
+      prompt: parsed.prompt,
+      rationale: typeof parsed.rationale === "string" ? parsed.rationale : null,
+      capturedAt: typeof parsed.capturedAt === "string" ? parsed.capturedAt : new Date(0).toISOString()
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function readPendingCopilotCliPrompt(repositoryRoot: string): Promise<PendingCodexPrompt | null> {
+  const filePath = copilotCliPendingPromptPath(repositoryRoot);
   if (!existsSync(filePath)) {
     return null;
   }
@@ -475,7 +590,16 @@ export async function clearPendingCodexPrompt(repositoryRoot: string): Promise<v
 }
 
 export async function clearPendingCopilotPrompt(repositoryRoot: string): Promise<void> {
-  const filePath = copilotPendingPromptPath(repositoryRoot);
+  const filePath = copilotVsPendingPromptPath(repositoryRoot);
+  if (!existsSync(filePath)) {
+    return;
+  }
+
+  await writeFile(filePath, "", "utf8");
+}
+
+export async function clearPendingCopilotCliPrompt(repositoryRoot: string): Promise<void> {
+  const filePath = copilotCliPendingPromptPath(repositoryRoot);
   if (!existsSync(filePath)) {
     return;
   }
@@ -484,7 +608,11 @@ export async function clearPendingCopilotPrompt(repositoryRoot: string): Promise
 }
 
 export function vscodeCopilotHookConfigPath(repositoryRoot: string): string {
-  return path.join(repositoryRoot, VSCODE_HOOKS_DIR, VSCODE_COPILOT_HOOK_FILE_NAME);
+  return path.join(repositoryRoot, VSCODE_HOOKS_DIR, VSCODE_COPILOT_VS_HOOK_FILE_NAME);
+}
+
+export function copilotCliHookConfigPath(repositoryRoot: string): string {
+  return path.join(repositoryRoot, VSCODE_HOOKS_DIR, VSCODE_COPILOT_CLI_HOOK_FILE_NAME);
 }
 
 export function isCopilotFileEditEvent(input: VSCodeHookInput | null): boolean {
@@ -492,20 +620,25 @@ export function isCopilotFileEditEvent(input: VSCodeHookInput | null): boolean {
     return true;
   }
 
-  if (input.hookEventName && input.hookEventName !== "PostToolUse") {
+  const eventName = input.hookEventName ?? input.hook_event_name;
+  if (eventName && eventName !== "PostToolUse" && eventName !== "postToolUse") {
     return false;
   }
 
-  if (input.tool_name && FILE_EDIT_TOOL_NAMES.has(input.tool_name)) {
+  const toolName = input.tool_name ?? input.toolName;
+  if (toolName && FILE_EDIT_TOOL_NAMES.has(toolName)) {
     return true;
   }
-
-  const toolInput = input.tool_input;
-  if (!toolInput) {
+  if (toolName && READ_ONLY_TOOL_NAMES.has(toolName)) {
     return false;
   }
 
-  return Array.isArray(toolInput.files) || Boolean(toolInput.filePath || toolInput.oldFilePath || toolInput.newFilePath);
+  const toolInput = input.tool_input ?? (input.toolArgs && typeof input.toolArgs === "object" ? (input.toolArgs as VSCodeHookInput["tool_input"]) : undefined);
+  if (!toolInput) {
+    return extractHookFilePaths(input).length > 0;
+  }
+
+  return extractHookFilePaths(input).length > 0;
 }
 
 export function isCopilotPromptSubmitEvent(input: VSCodeHookInput | null): boolean {
@@ -513,7 +646,12 @@ export function isCopilotPromptSubmitEvent(input: VSCodeHookInput | null): boole
     return false;
   }
 
-  return input.hookEventName === "UserPromptSubmit";
+  const eventName = input.hookEventName ?? input.hook_event_name;
+  if (eventName) {
+    return eventName === "UserPromptSubmit" || eventName === "userPromptSubmitted";
+  }
+
+  return Boolean(extractVSCodeHookPrompt(input));
 }
 
 function normalizeHookFilePath(value: unknown): string | null {
@@ -525,7 +663,8 @@ function normalizeHookFilePath(value: unknown): string | null {
   if (
     !trimmed ||
     trimmed.startsWith(".anvil/") ||
-    trimmed === ANVIL_INTERNAL_HOOK_PATH ||
+    trimmed === ANVIL_INTERNAL_COPILOT_VS_HOOK_PATH ||
+    trimmed === ANVIL_INTERNAL_COPILOT_CLI_HOOK_PATH ||
     trimmed === ANVIL_INTERNAL_CODEX_HOOK_PATH
   ) {
     return null;
@@ -535,33 +674,63 @@ function normalizeHookFilePath(value: unknown): string | null {
 }
 
 export function extractHookFilePaths(input: VSCodeHookInput | null): string[] {
-  if (!input?.tool_input) {
-    return [];
-  }
-
-  const toolInput = input.tool_input;
   const paths = new Set<string>();
-
-  const directPaths = [
-    normalizeHookFilePath(toolInput.filePath),
-    normalizeHookFilePath(toolInput.oldFilePath),
-    normalizeHookFilePath(toolInput.newFilePath)
-  ].filter((value): value is string => Boolean(value));
-
-  for (const filePath of directPaths) {
-    paths.add(filePath);
+  const candidateRecords: Record<string, unknown>[] = [];
+  const toolInput =
+    input?.tool_input ??
+    (input?.toolArgs && typeof input.toolArgs === "object"
+      ? (input.toolArgs as VSCodeHookInput["tool_input"])
+      : undefined);
+  if (toolInput && typeof toolInput === "object") {
+    candidateRecords.push(toolInput as Record<string, unknown>);
+  }
+  if (input?.toolArgs && typeof input.toolArgs === "object") {
+    candidateRecords.push(input.toolArgs as Record<string, unknown>);
+  }
+  if (input && typeof input === "object") {
+    candidateRecords.push(input as Record<string, unknown>);
   }
 
-  if (Array.isArray(toolInput.files)) {
-    for (const item of toolInput.files) {
-      const filePath = normalizeHookFilePath(item);
-      if (filePath) {
-        paths.add(filePath);
+  for (const record of candidateRecords) {
+    const directCandidates = [
+      record.filePath,
+      record.file_path,
+      record.oldFilePath,
+      record.newFilePath,
+      record.old_file_path,
+      record.new_file_path,
+      record.path,
+      record.uri,
+      record.target,
+      record.targetFile
+    ];
+
+    for (const candidate of directCandidates) {
+      addNormalizedHookPath(paths, candidate);
+    }
+
+    extractNestedHookPaths(record.files, paths);
+    extractNestedHookPaths(record.edits, paths);
+    extractNestedHookPaths(record.writes, paths);
+    extractNestedHookPaths(record.changes, paths);
+    extractNestedHookPaths(record, paths);
+  }
+
+  if (paths.size > 0) {
+    return [...paths];
+  }
+
+  for (const record of candidateRecords) {
+    const command = record.command;
+    if (typeof command === "string") {
+      const extracted = extractCodexHookFilePathsFromText(command);
+      if (extracted.length > 0) {
+        return extracted;
       }
     }
   }
 
-  return [...paths];
+  return [];
 }
 
 function addNormalizedHookPath(paths: Set<string>, value: unknown): void {
@@ -594,6 +763,15 @@ function extractNestedHookPaths(value: unknown, paths: Set<string>): void {
     "file",
     "filePath",
     "file_path",
+    "uri",
+    "source",
+    "sourcePath",
+    "source_file",
+    "sourceFile",
+    "destination",
+    "destinationPath",
+    "destination_file",
+    "destinationFile",
     "target",
     "targetFile",
     "target_file",
@@ -684,7 +862,7 @@ function extractPromptFromRecord(record: Record<string, unknown>, depth = 0): st
     }
   }
 
-  const nestedKeys = ["tool_input", "payload", "request", "input", "data"];
+  const nestedKeys = ["tool_input", "toolArgs", "payload", "request", "input", "data"];
   for (const key of nestedKeys) {
     const nested = record[key];
     if (nested && typeof nested === "object") {
@@ -808,10 +986,10 @@ export function extractVSCodeHookRationale(input: VSCodeHookInput | null): strin
   );
 }
 
-export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<string> {
+export async function installCopilotVsHook(repositoryRoot: string): Promise<string> {
   const hookPath = vscodeCopilotHookConfigPath(repositoryRoot);
   const guardScript = await ensureExecutionGuardScript(repositoryRoot);
-  const promptWrapperPath = copilotPromptWrapperPath(repositoryRoot);
+  const promptWrapperPath = copilotVsPromptWrapperPath(repositoryRoot);
   const nodeExecutable = currentNodeExecutable();
   const guardScriptCommandPath = path.resolve(guardScript).replace(/\\/g, "/");
   const cliEntrypoint = currentCliEntrypoint();
@@ -823,8 +1001,8 @@ export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<
       repositoryRoot,
       cliEntrypoint,
       nodeExecutable,
-      "copilot-prompt-submit",
-      "--vscode-hook"
+      "copilot-vs-prompt-submit",
+      "--copilot-vs-hook"
     )}\n`,
     "utf8"
   );
@@ -834,7 +1012,7 @@ export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<
         PreToolUse: [
           {
             type: "command",
-            command: `"${nodeExecutable}" "${guardScriptCommandPath}" --host copilot`,
+            command: `"${nodeExecutable}" "${guardScriptCommandPath}" --host copilot-vs`,
             timeout: 10
           }
         ],
@@ -848,10 +1026,259 @@ export async function installVSCodeCopilotHook(repositoryRoot: string): Promise<
         PostToolUse: [
           {
             type: "command",
-            command: shellCommandForCurrentCli(["hook", "copilot-after-edit", "--vscode-hook"]),
+            command: shellCommandForCurrentCli(["hook", "copilot-after-edit", "--copilot-vs-hook"]),
             timeout: 30
           }
         ]
+      }
+    },
+    null,
+    2
+  );
+  await writeFile(hookPath, `${content}\n`, "utf8");
+  return hookPath;
+}
+
+export async function installCopilotCliHook(repositoryRoot: string): Promise<string> {
+  const hookPath = copilotCliHookConfigPath(repositoryRoot);
+  const guardScript = await ensureExecutionGuardScript(repositoryRoot);
+  const promptWrapperPath = copilotCliPromptWrapperPath(repositoryRoot);
+  const afterEditWrapperPath = copilotCliAfterEditWrapperPath(repositoryRoot);
+  const nodeExecutable = currentNodeExecutable();
+  const guardScriptCommandPath = path.resolve(guardScript).replace(/\\/g, "/");
+  const cliEntrypoint = currentCliEntrypoint();
+  const promptWrapperCommandPath = path.resolve(promptWrapperPath).replace(/\\/g, "/");
+  const afterEditWrapperCommandPath = path.resolve(afterEditWrapperPath).replace(/\\/g, "/");
+  await mkdir(path.dirname(hookPath), { recursive: true });
+  await writeFile(
+    promptWrapperPath,
+    `${promptWrapperContent(
+      repositoryRoot,
+      cliEntrypoint,
+      nodeExecutable,
+      "copilot-cli-prompt-submit",
+      "--copilot-cli-hook"
+    )}\n`,
+    "utf8"
+  );
+  const afterEditDebugPath = path.join(repositoryRoot, ".anvil", "copilot-cli-posttool-debug.json");
+  const afterEditWrapperContent = `import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+
+function readStdin() {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) {
+      resolve("");
+      return;
+    }
+
+    const chunks = [];
+    process.stdin.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8").trim()));
+  });
+}
+
+function normalizePathValue(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().replace(/\\\\/g, "/");
+  if (
+    !normalized ||
+    normalized.startsWith(".anvil/") ||
+    normalized === ".github/hooks/${VSCODE_COPILOT_CLI_HOOK_FILE_NAME}" ||
+    normalized === ".github/hooks/${VSCODE_COPILOT_VS_HOOK_FILE_NAME}" ||
+    normalized === ".codex/hooks.json"
+  ) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function addPath(paths, value) {
+  const normalized = normalizePathValue(value);
+  if (normalized) {
+    paths.add(normalized);
+  }
+}
+
+function collectNestedPaths(value, paths) {
+  if (typeof value === "string") {
+    addPath(paths, value);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectNestedPaths(item, paths);
+    }
+    return;
+  }
+
+  if (!value || typeof value !== "object") {
+    return;
+  }
+
+  const record = value;
+  const candidateKeys = [
+    "path",
+    "file",
+    "filePath",
+    "file_path",
+    "target",
+    "targetFile",
+    "target_file",
+    "source",
+    "sourcePath",
+    "sourceFile",
+    "destination",
+    "destinationPath",
+    "destinationFile",
+    "oldPath",
+    "newPath",
+    "oldFilePath",
+    "newFilePath",
+    "old_file_path",
+    "new_file_path",
+    "uri"
+  ];
+
+  for (const key of candidateKeys) {
+    addPath(paths, record[key]);
+  }
+
+  for (const nestedKey of ["files", "edits", "writes", "changes", "results", "args", "toolArgs", "tool_input"]) {
+    collectNestedPaths(record[nestedKey], paths);
+  }
+}
+
+function runAnvil(args, input = "") {
+  const result = spawnSync(${JSON.stringify(nodeExecutable)}, [${JSON.stringify(cliEntrypoint)}, ...args], {
+    cwd: process.cwd(),
+    input,
+    encoding: "utf8",
+    shell: false
+  });
+
+  if (result.stdout) {
+    process.stdout.write(result.stdout);
+  }
+
+  if (result.stderr) {
+    process.stderr.write(result.stderr);
+  }
+
+  process.exit(result.status ?? 0);
+}
+
+async function writeDebugRecord(rawInput, payload, editedPaths) {
+  const target = ${JSON.stringify(afterEditDebugPath)};
+  await mkdir(path.dirname(target), { recursive: true });
+  const record = {
+    timestamp: new Date().toISOString(),
+    cwd: process.cwd(),
+    rawInput,
+    payload,
+    extractedPaths: editedPaths
+  };
+  await writeFile(target, JSON.stringify(record, null, 2), "utf8");
+}
+
+const rawInput = await readStdin();
+let payload = null;
+
+if (rawInput) {
+  try {
+    payload = JSON.parse(rawInput);
+  } catch {
+    runAnvil(["hook", "copilot-after-edit", "--copilot-cli-hook"], rawInput);
+  }
+}
+
+const paths = new Set();
+collectNestedPaths(payload, paths);
+const editedPaths = [...paths];
+await writeDebugRecord(rawInput, payload, editedPaths);
+
+if (editedPaths.length > 0) {
+  const toolName =
+    typeof payload?.toolName === "string"
+      ? payload.toolName
+      : typeof payload?.tool_name === "string"
+        ? payload.tool_name
+        : "editFiles";
+  const prompt =
+    typeof payload?.prompt === "string" && payload.prompt.trim()
+      ? payload.prompt.trim()
+      : typeof payload?.userPrompt === "string" && payload.userPrompt.trim()
+        ? payload.userPrompt.trim()
+        : typeof payload?.user_prompt === "string" && payload.user_prompt.trim()
+          ? payload.user_prompt.trim()
+          : null;
+
+  const normalizedPayload = {
+    hookEventName: "PostToolUse",
+    toolName,
+    ...(prompt ? { prompt } : {}),
+    toolArgs: {
+      files: editedPaths.map((filePath) => ({ path: filePath }))
+    }
+  };
+
+  runAnvil(["hook", "copilot-after-edit", "--copilot-cli-hook"], JSON.stringify(normalizedPayload));
+}
+
+runAnvil(["hook", "copilot-after-edit", "--copilot-cli-hook"], rawInput);
+`;
+  await writeFile(afterEditWrapperPath, `${afterEditWrapperContent}\n`, "utf8");
+  const content = JSON.stringify(
+    {
+      version: 1,
+      hooks: {
+          preToolUse: [
+            {
+              type: "command",
+              bash: `"${nodeExecutable}" "${guardScriptCommandPath}" --host copilot-cli`,
+              powershell: powershellCommand(nodeExecutable, [guardScriptCommandPath, "--host", "copilot-cli"]),
+              cwd: repositoryRoot,
+              timeoutSec: 10
+            }
+          ],
+          permissionRequest: [
+            {
+              type: "command",
+              bash: `"${nodeExecutable}" "${guardScriptCommandPath}" --host copilot-cli --permission-request`,
+              powershell: powershellCommand(nodeExecutable, [
+                guardScriptCommandPath,
+                "--host",
+                "copilot-cli",
+                "--permission-request"
+              ]),
+              cwd: repositoryRoot,
+              timeoutSec: 10
+            }
+          ],
+          userPromptSubmitted: [
+            {
+              type: "command",
+              bash: `"${nodeExecutable}" "${promptWrapperCommandPath}"`,
+              powershell: powershellCommand(nodeExecutable, [promptWrapperCommandPath]),
+              cwd: repositoryRoot,
+              timeoutSec: 15
+            }
+          ],
+          postToolUse: [
+            {
+              type: "command",
+              bash: `"${nodeExecutable}" "${afterEditWrapperCommandPath}"`,
+              powershell: powershellCommand(nodeExecutable, [afterEditWrapperCommandPath]),
+              cwd: repositoryRoot,
+              timeoutSec: 30
+            }
+          ]
       }
     },
     null,
